@@ -38,6 +38,9 @@ from GNN_photodegradation.plots import (
 )
 from GNN_photodegradation.config import DATA_path, NUM_epochs
 from GNN_photodegradation.get_logger import get_logger
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem.Scaffolds import MurckoScaffold
 
 logger = get_logger()
 
@@ -52,6 +55,75 @@ torch.backends.cudnn.benchmark = False
 # ---------------------------------------------------------------
 
 out_prefix = "GCN"  # used in filenames
+
+def get_scaffold(smiles: str) -> str:
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return ""
+    return MurckoScaffold.MurckoScaffoldSmiles(mol=mol, includeChirality=False)
+
+
+def random_scaffold_split_df(
+    df,
+    smiles_col="Smile",
+    frac_train=0.75,
+    frac_val=0.125,
+    frac_test=0.125,
+    seed=42,
+):
+    df = df.copy()
+
+    # compute scaffolds
+    df["_scaffold"] = df[smiles_col].apply(get_scaffold)
+    df = df[df["_scaffold"] != ""].copy()
+
+    # group indices by scaffold
+    scaffolds = {}
+    for idx, scaf in zip(df.index.tolist(), df["_scaffold"].tolist()):
+        scaffolds.setdefault(scaf, []).append(idx)
+
+    scaffold_groups = list(scaffolds.values())
+
+    # shuffle scaffold groups
+    rng = np.random.RandomState(seed)
+    rng.shuffle(scaffold_groups)
+
+    n_total = len(df)
+    n_train = int(round(frac_train * n_total))
+    n_val = int(round(frac_val * n_total))
+
+    train_idx, val_idx, test_idx = [], [], []
+    for g in scaffold_groups:
+        if len(train_idx) + len(g) <= n_train:
+            train_idx.extend(g)
+        elif len(val_idx) + len(g) <= n_val:
+            val_idx.extend(g)
+        else:
+            test_idx.extend(g)
+
+    # ensure non-empty val/test by moving one scaffold group if needed
+    if len(val_idx) == 0 and len(train_idx) > 0:
+        moved = scaffold_groups[-1]
+        for i in moved:
+            if i in train_idx:
+                train_idx.remove(i)
+        val_idx.extend(moved)
+
+    if len(test_idx) == 0 and len(train_idx) > 0:
+        moved = scaffold_groups[-2] if len(scaffold_groups) > 1 else scaffold_groups[-1]
+        for i in moved:
+            if i in train_idx:
+                train_idx.remove(i)
+            if i in val_idx:
+                val_idx.remove(i)
+        test_idx.extend(moved)
+
+    train_df = df.loc[train_idx].drop(columns=["_scaffold"])
+    val_df = df.loc[val_idx].drop(columns=["_scaffold"])
+    test_df = df.loc[test_idx].drop(columns=["_scaffold"])
+
+    return train_df, val_df, test_df, train_idx, val_idx, test_idx
+
 
 
 def _safe_metrics(y_true, y_pred):
@@ -255,17 +327,20 @@ def main():
     df["logk"] = df["logk"].astype(np.float32)
 
     # ----------------------- Split dataset -----------------------
-    train_df, temp_df, train_idx, temp_idx = train_test_split(
-        df, df.index, test_size=0.25, random_state=SEED
-    )
-    val_df, test_df, val_idx, test_idx = train_test_split(
-        temp_df, temp_df.index, test_size=0.5, random_state=SEED
+    train_df, val_df, test_df, train_idx, val_idx, test_idx = random_scaffold_split_df(
+    df,
+    smiles_col="Smile",
+    frac_train=0.75,
+    frac_val=0.125,
+    frac_test=0.125,
+    seed=SEED,
     )
 
     # For plot labels (1-based)
-    train_idx = train_idx + 1
-    val_idx = val_idx + 1
-    test_idx = test_idx + 1
+    train_idx = np.array(train_idx) + 1
+    val_idx   = np.array(val_idx) + 1
+    test_idx  = np.array(test_idx) + 1
+
 
     # ----------------------- Organic Contaminant TE -----------------------
     # Leakage-safe target encoding: learned on TRAIN only
