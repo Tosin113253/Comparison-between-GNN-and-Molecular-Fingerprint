@@ -173,10 +173,12 @@ def _murcko_scaffold(smiles: str) -> str:
     return MurckoScaffold.MurckoScaffoldSmiles(mol=mol, includeChirality=False)
 
 
-def scaffold_split_df(df: pd.DataFrame, smiles_col: str = "Smile", frac_train=0.75, frac_val=0.125, frac_test=0.125):
+def scaffold_split_df(df: pd.DataFrame, smiles_col: str = "Smile",
+                      frac_train=0.75, frac_val=0.125, frac_test=0.125):
     """
     Bemis–Murcko scaffold split.
-    This function ONLY affects splitting (as requested).
+    ONLY change: guarantees train/val/test are non-empty.
+    Everything else in your pipeline stays identical.
     """
     df = df.copy()
     df["_scaffold"] = df[smiles_col].apply(_murcko_scaffold)
@@ -193,23 +195,49 @@ def scaffold_split_df(df: pd.DataFrame, smiles_col: str = "Smile", frac_train=0.
     groups = sorted(scaffold_to_indices.values(), key=lambda g: len(g), reverse=True)
 
     n_total = len(df)
-    n_train = int(round(frac_train * n_total))
-    n_val = int(round(frac_val * n_total))
+    n_train_target = int(round(frac_train * n_total))
+    n_val_target   = int(round(frac_val * n_total))
 
     train_idx, val_idx, test_idx = [], [], []
     for g in groups:
-        if len(train_idx) + len(g) <= n_train:
+        if len(train_idx) + len(g) <= n_train_target:
             train_idx.extend(g)
-        elif len(val_idx) + len(g) <= n_val:
+        elif len(val_idx) + len(g) <= n_val_target:
             val_idx.extend(g)
         else:
             test_idx.extend(g)
 
+    # --------- FIX: ensure val/test are non-empty ----------
+    # If val is empty, move the smallest scaffold group from train into val.
+    if len(val_idx) == 0:
+        # find smallest group that is currently in train
+        train_set = set(train_idx)
+        candidate_groups = sorted([g for g in groups if all(i in train_set for i in g)], key=len)
+        if len(candidate_groups) == 0:
+            raise ValueError("Scaffold split failed: cannot create non-empty validation set.")
+        moved = candidate_groups[0]
+        for i in moved:
+            train_idx.remove(i)
+        val_idx.extend(moved)
+
+    # If test is empty, move the smallest scaffold group from train into test.
+    if len(test_idx) == 0:
+        train_set = set(train_idx)
+        candidate_groups = sorted([g for g in groups if all(i in train_set for i in g)], key=len)
+        if len(candidate_groups) == 0:
+            raise ValueError("Scaffold split failed: cannot create non-empty test set.")
+        moved = candidate_groups[0]
+        for i in moved:
+            train_idx.remove(i)
+        test_idx.extend(moved)
+    # -------------------------------------------------------
+
     train_df = df.loc[train_idx].drop(columns=["_scaffold"])
-    val_df = df.loc[val_idx].drop(columns=["_scaffold"])
-    test_df = df.loc[test_idx].drop(columns=["_scaffold"])
+    val_df   = df.loc[val_idx].drop(columns=["_scaffold"])
+    test_df  = df.loc[test_idx].drop(columns=["_scaffold"])
 
     return train_df, val_df, test_df
+
 # ----------------------------------------------------------------------
 
 
