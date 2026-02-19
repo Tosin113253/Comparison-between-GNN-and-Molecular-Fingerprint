@@ -21,7 +21,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
-from GNN_photodegradation.models.gcn_model import StrongGCN as GNNModel
+from GNN_photodegradation.models.gcn_model import StrongGCN
+
 
 import shap
 import matplotlib.pyplot as plt
