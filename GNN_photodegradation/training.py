@@ -1,14 +1,11 @@
-# training.py (complete, copy-paste) — MINIMAL CHANGES ONLY
+# training.py (complete, copy-paste)
 # ONLY changes:
-# 1) Random split -> Scaffold split
-# 2) Runtime reporting added
-#
-# Everything else is exactly your original logic:
-# - Same features, same baseline + SHAP, same GNN training pipeline, same plots, same dataloaders, same early stopping.
+# 1) Use RANDOM scaffold-group split (train/val/test) instead of train_test_split
+# 2) Add training time for GNN training loop
 
 import os
-import random
 import time
+import random
 import numpy as np
 import pandas as pd
 
@@ -17,7 +14,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
@@ -41,10 +37,8 @@ from GNN_photodegradation.plots import (
 from GNN_photodegradation.config import DATA_path, NUM_epochs
 from GNN_photodegradation.get_logger import get_logger
 
-# ----- NEW (for scaffold split only) -----
 from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
-# ----------------------------------------
 
 logger = get_logger()
 
@@ -59,6 +53,93 @@ torch.backends.cudnn.benchmark = False
 # ---------------------------------------------------------------
 
 out_prefix = "GCN"  # used in filenames
+
+
+# ===================== SCAFFOLD SPLIT (RANDOM GROUPS) =====================
+def get_scaffold(smiles: str) -> str:
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return ""
+    return MurckoScaffold.MurckoScaffoldSmiles(mol=mol, includeChirality=False)
+
+
+def random_scaffold_split_df(
+    df: pd.DataFrame,
+    smiles_col: str = "Smile",
+    frac_train: float = 0.75,
+    frac_val: float = 0.125,
+    frac_test: float = 0.125,
+    seed: int = 42,
+):
+    """
+    Random scaffold-group split (shuffle scaffold groups), returning train/val/test.
+    Keeps whole scaffolds together (no leakage).
+    Ensures train/val/test are non-empty.
+    """
+    df = df.copy()
+
+    # compute scaffolds
+    df["_scaffold"] = df[smiles_col].apply(get_scaffold)
+    df = df[df["_scaffold"] != ""].copy()
+
+    # group indices by scaffold
+    scaffolds = {}
+    for idx, scaf in zip(df.index.tolist(), df["_scaffold"].tolist()):
+        scaffolds.setdefault(scaf, []).append(idx)
+
+    scaffold_groups = list(scaffolds.values())
+
+    # shuffle scaffold groups
+    rng = np.random.RandomState(seed)
+    rng.shuffle(scaffold_groups)
+
+    n_total = len(df)
+    n_train = int(round(frac_train * n_total))
+    n_val = int(round(frac_val * n_total))
+    # remainder goes to test
+
+    train_idx, val_idx, test_idx = [], [], []
+
+    for g in scaffold_groups:
+        if len(train_idx) + len(g) <= n_train:
+            train_idx.extend(g)
+        elif len(val_idx) + len(g) <= n_val:
+            val_idx.extend(g)
+        else:
+            test_idx.extend(g)
+
+    # ---- guarantee non-empty splits ----
+    # move one scaffold group if needed
+    if len(val_idx) == 0:
+        moved = scaffold_groups[-1]
+        for i in moved:
+            if i in train_idx:
+                train_idx.remove(i)
+        val_idx.extend(moved)
+
+    if len(test_idx) == 0:
+        moved = scaffold_groups[-2] if len(scaffold_groups) > 1 else scaffold_groups[-1]
+        for i in moved:
+            if i in train_idx:
+                train_idx.remove(i)
+            if i in val_idx:
+                val_idx.remove(i)
+        test_idx.extend(moved)
+
+    if len(train_idx) == 0:
+        # steal from test
+        moved = scaffold_groups[0]
+        for i in moved:
+            if i in test_idx:
+                test_idx.remove(i)
+        train_idx.extend(moved)
+
+    train_df = df.loc[train_idx].drop(columns=["_scaffold"])
+    val_df = df.loc[val_idx].drop(columns=["_scaffold"])
+    test_df = df.loc[test_idx].drop(columns=["_scaffold"])
+
+    return train_df, val_df, test_df, train_idx, val_idx, test_idx
+# ========================================================================
 
 
 def _safe_metrics(y_true, y_pred):
@@ -83,10 +164,6 @@ def run_experimental_baselines(
     """
     Baseline on tabular features ONLY (experimental + OrganicContaminant_TE),
     so SHAP shows only meaningful features (no Graph_*).
-    Produces:
-      - {out_prefix}_metrics.csv
-      - {out_prefix}_feature_importance.csv (RF)
-      - {out_prefix}_shap_beeswarm.png (optional)
     """
     X_train = train_df[feature_cols].values
     y_train = train_df[target_col].values
@@ -109,7 +186,7 @@ def run_experimental_baselines(
     results.append({"model": "Ridge", "split": "val", **_safe_metrics(y_val, ridge.predict(X_val))})
     results.append({"model": "Ridge", "split": "test", **_safe_metrics(y_test, ridge.predict(X_test))})
 
-    # RandomForest (no scaling needed)
+    # RandomForest
     rf = RandomForestRegressor(
         n_estimators=500,
         random_state=SEED,
@@ -126,9 +203,9 @@ def run_experimental_baselines(
     metrics_df.to_csv(metrics_path, index=False)
 
     # Feature importance (RF)
-    fi = pd.DataFrame(
-        {"Feature": feature_cols, "Importance": rf.feature_importances_.astype(float)}
-    ).sort_values("Importance", ascending=False)
+    fi = pd.DataFrame({"Feature": feature_cols, "Importance": rf.feature_importances_.astype(float)}).sort_values(
+        "Importance", ascending=False
+    )
     fi_path = f"{out_prefix}_feature_importance.csv"
     fi.to_csv(fi_path, index=False)
 
@@ -136,11 +213,8 @@ def run_experimental_baselines(
     shap_path = None
     if make_shap:
         try:
-            # sample for speed
-            n_bg = min(300, X_train.shape[0])
             n_plot = min(500, X_train.shape[0])
             rng = np.random.default_rng(SEED)
-            bg_idx = rng.choice(X_train.shape[0], size=n_bg, replace=False)
             plot_idx = rng.choice(X_train.shape[0], size=n_plot, replace=False)
 
             explainer = shap.TreeExplainer(rf)
@@ -163,82 +237,6 @@ def run_experimental_baselines(
             logger.warning(f"SHAP plot failed for baseline: {e}")
 
     return metrics_path, fi_path, shap_path
-
-
-# ----------------------- NEW: Scaffold split ONLY -----------------------
-def _murcko_scaffold(smiles: str) -> str:
-    mol = Chem.MolFromSmiles(str(smiles))
-    if mol is None:
-        return ""
-    return MurckoScaffold.MurckoScaffoldSmiles(mol=mol, includeChirality=False)
-
-
-def scaffold_split_df(df: pd.DataFrame, smiles_col: str = "Smile",
-                      frac_train=0.75, frac_val=0.125, frac_test=0.125):
-    """
-    Bemis–Murcko scaffold split.
-    ONLY change: guarantees train/val/test are non-empty.
-    Everything else in your pipeline stays identical.
-    """
-    df = df.copy()
-    df["_scaffold"] = df[smiles_col].apply(_murcko_scaffold)
-
-    # drop invalid SMILES
-    df = df[df["_scaffold"] != ""].copy()
-
-    # group indices by scaffold
-    scaffold_to_indices = {}
-    for idx, scaf in zip(df.index.tolist(), df["_scaffold"].tolist()):
-        scaffold_to_indices.setdefault(scaf, []).append(idx)
-
-    # sort scaffold groups by size (desc)
-    groups = sorted(scaffold_to_indices.values(), key=lambda g: len(g), reverse=True)
-
-    n_total = len(df)
-    n_train_target = int(round(frac_train * n_total))
-    n_val_target   = int(round(frac_val * n_total))
-
-    train_idx, val_idx, test_idx = [], [], []
-    for g in groups:
-        if len(train_idx) + len(g) <= n_train_target:
-            train_idx.extend(g)
-        elif len(val_idx) + len(g) <= n_val_target:
-            val_idx.extend(g)
-        else:
-            test_idx.extend(g)
-
-    # --------- FIX: ensure val/test are non-empty ----------
-    # If val is empty, move the smallest scaffold group from train into val.
-    if len(val_idx) == 0:
-        # find smallest group that is currently in train
-        train_set = set(train_idx)
-        candidate_groups = sorted([g for g in groups if all(i in train_set for i in g)], key=len)
-        if len(candidate_groups) == 0:
-            raise ValueError("Scaffold split failed: cannot create non-empty validation set.")
-        moved = candidate_groups[0]
-        for i in moved:
-            train_idx.remove(i)
-        val_idx.extend(moved)
-
-    # If test is empty, move the smallest scaffold group from train into test.
-    if len(test_idx) == 0:
-        train_set = set(train_idx)
-        candidate_groups = sorted([g for g in groups if all(i in train_set for i in g)], key=len)
-        if len(candidate_groups) == 0:
-            raise ValueError("Scaffold split failed: cannot create non-empty test set.")
-        moved = candidate_groups[0]
-        for i in moved:
-            train_idx.remove(i)
-        test_idx.extend(moved)
-    # -------------------------------------------------------
-
-    train_df = df.loc[train_idx].drop(columns=["_scaffold"])
-    val_df   = df.loc[val_idx].drop(columns=["_scaffold"])
-    test_df  = df.loc[test_idx].drop(columns=["_scaffold"])
-
-    return train_df, val_df, test_df
-
-# ----------------------------------------------------------------------
 
 
 def main():
@@ -301,36 +299,35 @@ def main():
     df[numerical_features] = df[numerical_features].astype(np.float32)
     df["logk"] = df["logk"].astype(np.float32)
 
-    # ----------------------- Split dataset (CHANGED to scaffold) -----------------------
-    t_split0 = time.perf_counter()
-    train_df, val_df, test_df = scaffold_split_df(df, smiles_col="Smile", frac_train=0.75, frac_val=0.125, frac_test=0.125)
-    t_split1 = time.perf_counter()
+    # ----------------------- Split dataset (SCAFFOLD) -----------------------
+    train_df, val_df, test_df, train_idx, val_idx, test_idx = random_scaffold_split_df(
+        df,
+        smiles_col="Smile",
+        frac_train=0.75,
+        frac_val=0.125,
+        frac_test=0.125,
+        seed=SEED,
+    )
+    logger.info(f"Random scaffold split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
 
     # For plot labels (1-based)
-    train_idx = train_df.index.to_numpy() + 1
-    val_idx = val_df.index.to_numpy() + 1
-    test_idx = test_df.index.to_numpy() + 1
-
-    logger.info(f"Scaffold split sizes: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
-    logger.info(f"Split runtime (sec): {t_split1 - t_split0:.2f}")
+    train_idx = np.array(train_idx) + 1
+    val_idx = np.array(val_idx) + 1
+    test_idx = np.array(test_idx) + 1
+    # ----------------------------------------------------------------------
 
     # ----------------------- Organic Contaminant TE -----------------------
-    # Leakage-safe target encoding: learned on TRAIN only
     global_mean = float(train_df["logk"].mean())
     te_map = train_df.groupby("Smile")["logk"].mean().to_dict()
 
     for dfx in (train_df, val_df, test_df):
-        dfx["OrganicContaminant_TE"] = (
-            dfx["Smile"].map(te_map).fillna(global_mean).astype(np.float32)
-        )
+        dfx["OrganicContaminant_TE"] = dfx["Smile"].map(te_map).fillna(global_mean).astype(np.float32)
 
     logger.info("Created OrganicContaminant_TE via leakage-safe target encoding.")
     # ---------------------------------------------------------------------
 
     # ------------------- Baseline (tabular) + SHAP -----------------------
     baseline_feature_cols = numerical_features + ["OrganicContaminant_TE"]
-
-    t_base0 = time.perf_counter()
     metrics_path, fi_path, shap_path = run_experimental_baselines(
         train_df=train_df,
         val_df=val_df,
@@ -340,17 +337,13 @@ def main():
         out_prefix="baseline_tabular",
         make_shap=True,
     )
-    t_base1 = time.perf_counter()
-
     logger.info(f"Baseline metrics saved: {metrics_path}")
     logger.info(f"Baseline feature importance saved: {fi_path}")
     if shap_path:
         logger.info(f"Baseline SHAP beeswarm saved: {shap_path}")
-    logger.info(f"Baseline runtime (sec): {t_base1 - t_base0:.2f}")
     # ---------------------------------------------------------------------
 
     # ----------------------- Create GNN datasets -------------------------
-    # IMPORTANT: GNN pipeline remains unchanged (graphs + standardized experimental feats)
     train_dataset = Create_Dataset(train_df, numerical_features)
     scaler = train_dataset.scaler
     val_dataset = Create_Dataset(val_df, numerical_features, scaler=scaler)
@@ -358,16 +351,9 @@ def main():
     logger.info("Datasets created and features standardized (GNN).")
 
     # ----------------------- DataLoaders -------------------------
-    # (unchanged) kept your shuffle=False exactly
-    train_loader = DataLoader(
-        train_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn
-    )
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
     logger.info("Data loaders initialized (GNN).")
 
     # ----------------------- Model init --------------------------
@@ -389,7 +375,8 @@ def main():
     best_val_loss = float("inf")
     patience_counter = 0
 
-    t_train0 = time.perf_counter()
+    # ---- TRAINING TIME START ----
+    train_start = time.time()
 
     for epoch in range(1, num_epochs + 1):
         model.train()
@@ -441,12 +428,16 @@ def main():
                 print("Early stopping triggered.")
                 break
 
-    t_train1 = time.perf_counter()
-    logger.info(f"GNN training runtime (sec): {t_train1 - t_train0:.2f}")
+    # ---- TRAINING TIME END ----
+    train_end = time.time()
+    gnn_train_time_sec = float(train_end - train_start)
+    logger.info(f"GNN training time (sec): {gnn_train_time_sec:.2f}")
+
+    # save training time
+    with open("gnn_training_time.txt", "w") as f:
+        f.write(f"GNN training time (sec): {gnn_train_time_sec:.2f}\n")
 
     # ----------------------- Evaluation --------------------------
-    t_eval0 = time.perf_counter()
-
     model.load_state_dict(torch.load("best_model.pth", map_location=device))
     model.eval()
     logger.info("Best model loaded for evaluation.")
@@ -526,24 +517,7 @@ def main():
         "Combined", title="3D UMAP Plot", dimensions=3
     )
 
-    t_eval1 = time.perf_counter()
-    logger.info(f"GNN eval+plots runtime (sec): {t_eval1 - t_eval0:.2f}")
-
     logger.info("All plots have been generated and saved.")
-
-    # ----------------------- Runtime summary file (NEW) -----------------------
-    runtime_df = pd.DataFrame([{
-        "split_time_sec": float(t_split1 - t_split0),
-        "baseline_time_sec": float(t_base1 - t_base0),
-        "gnn_train_time_sec": float(t_train1 - t_train0),
-        "gnn_eval_time_sec": float(t_eval1 - t_eval0),
-        "train_size": int(len(train_df)),
-        "val_size": int(len(val_df)),
-        "test_size": int(len(test_df)),
-    }])
-    runtime_df.to_csv(f"{out_prefix}_runtime_summary.csv", index=False)
-    logger.info(f"Runtime summary saved to: {out_prefix}_runtime_summary.csv")
-    # ------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
