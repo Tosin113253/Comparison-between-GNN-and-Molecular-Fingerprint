@@ -185,12 +185,14 @@ def scaffold_split_df(
     frac_train: float = 0.70,
     frac_val: float = 0.15,
     frac_test: float = 0.15,
+    min_per_split: int = 1,   # <- ensures non-empty splits
 ):
     """
-    Deterministic Bemis–Murcko scaffold split:
+    Deterministic Bemis–Murcko scaffold split with safety:
     - group by scaffold
     - sort groups by size (desc)
     - greedy assignment to train/val/test to hit target fractions
+    - if val or test becomes empty, move smallest groups from train to fill them
     """
     assert abs(frac_train + frac_val + frac_test - 1.0) < 1e-9, "Fractions must sum to 1."
 
@@ -213,25 +215,66 @@ def scaffold_split_df(
     for idx, scaf in zip(df.index.tolist(), df["_scaffold"].tolist()):
         scaffold_to_indices.setdefault(scaf, []).append(idx)
 
+    # groups: list[list[idx]]
     groups = sorted(scaffold_to_indices.values(), key=lambda g: (-len(g), str(g[0])))
 
     n_total = len(df)
-    n_train = int(round(frac_train * n_total))
-    n_val = int(round(frac_val * n_total))
+    n_train_target = int(round(frac_train * n_total))
+    n_val_target = int(round(frac_val * n_total))
 
     train_idx, val_idx, test_idx = [], [], []
     for g in groups:
-        if len(train_idx) + len(g) <= n_train:
+        if len(train_idx) + len(g) <= n_train_target:
             train_idx.extend(g)
-        elif len(val_idx) + len(g) <= n_val:
+        elif len(val_idx) + len(g) <= n_val_target:
             val_idx.extend(g)
         else:
             test_idx.extend(g)
+
+    # ---------------- SAFETY: ensure val/test not empty ----------------
+    # If val or test is empty, move smallest scaffold groups from train to fill.
+    if len(val_idx) < min_per_split or len(test_idx) < min_per_split:
+        # rebuild groups in ascending order (smallest first) for moving
+        groups_small_first = sorted(groups, key=lambda g: (len(g), str(g[0])))
+
+        def pop_group_from_train():
+            # find a group entirely inside train and move it out
+            train_set = set(train_idx)
+            for g in groups_small_first:
+                if all(i in train_set for i in g) and len(g) > 0:
+                    for i in g:
+                        train_set.remove(i)
+                    return list(train_set), g
+            return train_idx, []
+
+        # fill val if empty
+        while len(val_idx) < min_per_split and len(train_idx) > min_per_split:
+            train_idx, moved = pop_group_from_train()
+            if not moved:
+                break
+            val_idx.extend(moved)
+
+        # fill test if empty
+        while len(test_idx) < min_per_split and len(train_idx) > min_per_split:
+            train_idx, moved = pop_group_from_train()
+            if not moved:
+                break
+            test_idx.extend(moved)
+
+    # Final guard
+    if len(train_idx) == 0 or len(val_idx) == 0 or len(test_idx) == 0:
+        raise ValueError(
+            f"Scaffold split produced empty split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}. "
+            "This usually means one scaffold dominates the dataset. Consider using random split, "
+            "or reduce min_per_split, or stratify by scaffold with different fractions."
+        )
+    # -------------------------------------------------------------------
 
     train_df = df.loc[train_idx].drop(columns=["_scaffold"])
     val_df = df.loc[val_idx].drop(columns=["_scaffold"])
     test_df = df.loc[test_idx].drop(columns=["_scaffold"])
     return train_df, val_df, test_df
+
 
 
 def main():
