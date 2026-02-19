@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from GNN_photodegradation.featurizer import Create_Dataset, collate_fn
-from GNN_photodegradation.models.gat_model import GNNModel
+from GNN_photodegradation.models.gcn_model import StrongGCN
 from GNN_photodegradation.evaluations import collect_predictions, compute_regression_stats
 from GNN_photodegradation.plots import (
     plot_calculated_vs_experimental,
