@@ -21,7 +21,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
-from GNN_photodegradation.models.gcn_model import StrongGNNModel
+from GNN_photodegradation.models.gcn_model import StrongGCN
 
 
 
@@ -396,7 +396,7 @@ def main():
 
     # ----------------------- Model init --------------------------
     experimental_input_dim = train_dataset.experimental_feats.shape[1]
-    model = StrongGNNModel(node_input_dim=22, experimental_input_dim=experimental_input_dim)
+    model = StrongGCN(node_input_dim=22, experimental_input_dim=experimental_input_dim)
 
 
 
