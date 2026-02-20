@@ -19,12 +19,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
-from GNN_photodegradation.models.gcn_model import StrongGCN
+from GNN_photodegradation.models.gcn_model import StrongGNNModel
 import shap
 import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from GNN_photodegradation.featurizer import Create_Dataset, collate_fn
-from GNN_photodegradation.models.gcn_model import StrongGCN
+from GNN_photodegradation.models.gcn_model import StrongGNNModel
 from GNN_photodegradation.evaluations import collect_predictions, compute_regression_stats
 from GNN_photodegradation.plots import (
     plot_calculated_vs_experimental,
@@ -389,7 +389,15 @@ def main():
 
     # ----------------------- Model init --------------------------
     experimental_input_dim = train_dataset.experimental_feats.shape[1]
-    model = StrongGCN(node_input_dim=22, experimental_input_dim=experimental_input_dim)
+    model = StrongGNNModel(
+    node_input_dim=22,
+    experimental_input_dim=experimental_input_dim,
+    hidden_dim=128,
+    num_layers=5,
+    experimental_hidden_dim=128,
+    combined_hidden_dim=256,
+    dropout=0.2,
+)
 
 
 
