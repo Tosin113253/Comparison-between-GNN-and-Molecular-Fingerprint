@@ -9,12 +9,10 @@ import os
 import random
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -22,14 +20,9 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from GNN_photodegradation.models.gcn_model import StrongGCN
-
-
-
 import shap
 import matplotlib.pyplot as plt
-
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-
 from GNN_photodegradation.featurizer import Create_Dataset, collate_fn
 from GNN_photodegradation.models.gcn_model import StrongGCN
 from GNN_photodegradation.evaluations import collect_predictions, compute_regression_stats
