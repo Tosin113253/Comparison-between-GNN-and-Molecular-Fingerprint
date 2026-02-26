@@ -287,7 +287,7 @@ def main():
     X = np.arange(len(df))  # placeholder indices (split returns indices; we apply to df)
 
     X_train_i, X_test_i, y_train_i, y_test_i, train_idx, test_idx = scaffold_train_test_split(
-        X, Y, smiles, test_size=0.3, random_state=SEED, n_tries=2000
+        X, Y, smiles, test_size=0.25, random_state=SEED, n_tries=2000
     )
 
     # Convert indices -> dataframes
@@ -354,7 +354,7 @@ def main():
 
     # ----------------------- Train setup -------------------------
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
     logger.info("Loss function and optimizer defined (no validation).")
 
     # ----------------------- Training loop (TRAIN ONLY) -----------------------
