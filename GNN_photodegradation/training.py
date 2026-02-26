@@ -1,19 +1,20 @@
 # training.py (COMPLETE, corrected, copy-paste)
-# What this version does (NO validation):
-# ✅ TRUE scaffold split (your exact algorithm) + prints scaffold stats
-# ✅ TRAIN+TEST only
-# ✅ Fixes common silent issues: shuffle=True, shape-safe loss, optional label scaling (OFF by default)
-# ✅ Adds a BASELINE tabular model + SHAP that INCLUDES OrganicContaminant via leakage-safe Target Encoding
-# ✅ Writes clean CSVs:
-#    - baseline_tabular_metrics.csv, baseline_tabular_feature_importance.csv, baseline_tabular_shap_beeswarm.png
-#    - baseline_tabular_results_with_runtime.csv
-#    - GCN_Regression_results.xlsx (from your pipeline)
-#    - GCN_gnn_metrics_train_test.csv  (train/test MSE/RMSE/MAE/r2)
-#    - GCN_gnn_runtime_with_total.csv  (final_fit_seconds + total_seconds)
-#
-# IMPORTANT:
-# If test r2 is ~0 or negative after this, it is usually NOT a code bug—
-# it’s the expected difficulty of strict scaffold OOD generalization.
+# CORRECTION ADDED:
+# ✅ GNN now uses SAME target transform + SAME filter as your XGB run:
+#       y = -logk
+#       keep only 0 < y < 6
+# ✅ Scaffold split applied AFTER filtering (same universe as XGB)
+# ✅ Train/Test only (no validation)
+# ✅ Baseline tabular + SHAP includes OrganicContaminant via leakage-safe TE (train-only)
+# ✅ Fixes training stability: shuffle=True + shape-safe loss + grad clipping
+# ✅ Outputs CSVs:
+#   baseline_tabular_metrics.csv
+#   baseline_tabular_feature_importance.csv
+#   baseline_tabular_shap_beeswarm.png (if SHAP works)
+#   baseline_tabular_results_with_runtime.csv
+#   GCN_gnn_metrics_train_test.csv
+#   GCN_gnn_runtime_with_total.csv
+#   GCN_Regression_results.xlsx + your plots
 
 import os
 import random
@@ -65,10 +66,13 @@ torch.backends.cudnn.benchmark = False
 
 out_prefix = "GCN"
 
-# ----------------------- Optional: label scaling -----------------------
-# This often helps stability across OOD splits. Keep OFF if you want raw logk.
-USE_LABEL_SCALER = False
-# ----------------------------------------------------------------------
+# ----------------------- Target settings (MATCH XGB) -----------------------
+# XGB used: Y_all = -dataset["logk"].values ; mask = (0 < Y_all) & (Y_all < 6)
+TARGET_COL_RAW = "logk"
+TARGET_COL_Y   = "y"          # we will create df["y"] = -df["logk"]
+Y_MIN = 0.0
+Y_MAX = 6.0
+# -------------------------------------------------------------------------
 
 
 def _safe_metrics(y_true, y_pred):
@@ -139,7 +143,7 @@ def run_experimental_baselines_train_test(
     results_metrics = []
     results_runtime_rows = []
 
-    # ---------------- Ridge ----------------
+    # Ridge
     ridge = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
@@ -160,7 +164,7 @@ def run_experimental_baselines_train_test(
         "test_r2": float(ridge.score(X_test, y_test)),
     })
 
-    # -------------- RandomForest --------------
+    # RandomForest
     rf = RandomForestRegressor(
         n_estimators=500,
         random_state=SEED,
@@ -185,9 +189,9 @@ def run_experimental_baselines_train_test(
     metrics_path = f"{out_prefix}_metrics.csv"
     metrics_df.to_csv(metrics_path, index=False)
 
-    fi = pd.DataFrame({"Feature": feature_cols, "Importance": rf.feature_importances_.astype(float)}).sort_values(
-        "Importance", ascending=False
-    )
+    fi = pd.DataFrame(
+        {"Feature": feature_cols, "Importance": rf.feature_importances_.astype(float)}
+    ).sort_values("Importance", ascending=False)
     fi_path = f"{out_prefix}_feature_importance.csv"
     fi.to_csv(fi_path, index=False)
 
@@ -265,38 +269,36 @@ def main():
         return
 
     # ----------------------- Coerce numeric ----------------------
-    df["logk"] = pd.to_numeric(df["logk"], errors="coerce")
+    df[TARGET_COL_RAW] = pd.to_numeric(df[TARGET_COL_RAW], errors="coerce")
 
-    numerical_features = [
-        "Intensity",
-        "Wavelength",
-        "Temp",
-        "Dosage",
-        "InitialC",
-        "Humid",
-        "Reactor",
-    ]
+    numerical_features = ["Intensity","Wavelength","Temp","Dosage","InitialC","Humid","Reactor"]
     for col in numerical_features:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     before = len(df)
-    df = df.dropna(subset=["Smile", "logk"] + numerical_features).copy()
+    df = df.dropna(subset=["Smile", TARGET_COL_RAW] + numerical_features).copy()
     after = len(df)
     if after < before:
         logger.info(f"Dropped {before - after} rows due to NaNs in required columns.")
 
     df[numerical_features] = df[numerical_features].astype(np.float32)
-    df["logk"] = df["logk"].astype(np.float32)
+    df[TARGET_COL_RAW] = df[TARGET_COL_RAW].astype(np.float32)
 
-    # -----------------------
-    # TRUE scaffold split (TRAIN + TEST ONLY)
-    # -----------------------
+    # ----------------------- MATCH XGB TARGET + FILTER -----------------------
+    df[TARGET_COL_Y] = (-df[TARGET_COL_RAW]).astype(np.float32)
+
+    mask = (df[TARGET_COL_Y].values > Y_MIN) & (df[TARGET_COL_Y].values < Y_MAX)
+    df = df.loc[mask].copy()
+    df = df.reset_index(drop=True)
+    logger.info(f"After y filter ({Y_MIN}<{TARGET_COL_Y}<{Y_MAX}): {len(df)} rows")
+
+    # ----------------------- TRUE scaffold split on FILTERED df -----------------------
     smiles_all = df["Smile"].values
-    Y_all = df["logk"].values
-    X_idx = np.arange(len(df))  # placeholder indices for splitter
+    y_all = df[TARGET_COL_Y].values
+    X_idx = np.arange(len(df))  # placeholder indices
 
     _, _, _, _, train_idx, test_idx = scaffold_train_test_split(
-        X_idx, Y_all, smiles_all, test_size=0.25, random_state=SEED, n_tries=2000
+        X_idx, y_all, smiles_all, test_size=0.30, random_state=SEED, n_tries=2000
     )
 
     train_df = df.iloc[train_idx].copy()
@@ -312,18 +314,17 @@ def main():
     print("Train scaffold counts (top 5):", Counter(train_scaff).most_common(5))
     print("Test  scaffold counts (top 5):", Counter(test_scaff).most_common(5))
 
-    print("Train y mean/std:", float(train_df["logk"].mean()), float(train_df["logk"].std()))
-    print("Test  y mean/std:", float(test_df["logk"].mean()),  float(test_df["logk"].std()))
+    print("Train y mean/std:", float(train_df[TARGET_COL_Y].mean()), float(train_df[TARGET_COL_Y].std()))
+    print("Test  y mean/std:", float(test_df[TARGET_COL_Y].mean()),  float(test_df[TARGET_COL_Y].std()))
 
-    # Labels for plotting (1-based)
+    # Labels for plots (1-based)
     train_labels = np.array(train_idx) + 1
     test_labels  = np.array(test_idx) + 1
 
-    # -----------------------
-    # Leakage-safe Target Encoding for Organic Contaminant (Smile)  (BASELINE ONLY)
-    # -----------------------
-    global_mean = float(train_df["logk"].mean())
-    te_map = train_df.groupby("Smile")["logk"].mean().to_dict()
+    # ----------------------- Leakage-safe TE for Organic Contaminant (Smile) -----------------------
+    global_mean = float(train_df[TARGET_COL_Y].mean())
+    te_map = train_df.groupby("Smile")[TARGET_COL_Y].mean().to_dict()
+
     for dfx in (train_df, test_df):
         dfx["OrganicContaminant_TE"] = dfx["Smile"].map(te_map).fillna(global_mean).astype(np.float32)
 
@@ -333,7 +334,7 @@ def main():
         train_df=train_df,
         test_df=test_df,
         feature_cols=baseline_feature_cols,
-        target_col="logk",
+        target_col=TARGET_COL_Y,
         out_prefix="baseline_tabular",
         make_shap=True,
     )
@@ -343,47 +344,44 @@ def main():
     if shap_path:
         logger.info(f"Baseline SHAP saved: {shap_path}")
 
-    # ------------------- GNN datasets -------------------
-    train_dataset = Create_Dataset(train_df, numerical_features)
-    scaler = train_dataset.scaler
-    test_dataset = Create_Dataset(test_df, numerical_features, scaler=scaler)
+    # ----------------------- Create GNN datasets -----------------------
+    # NOTE: Create_Dataset likely uses 'logk' by default internally.
+    # If your Create_Dataset reads df['logk'] as target, we MUST provide it the corrected target.
+    #
+    # SAFEST FIX: overwrite logk in the df slices with our y target
+    # so your existing pipeline remains unchanged.
+    train_df_for_gnn = train_df.copy()
+    test_df_for_gnn  = test_df.copy()
+    train_df_for_gnn["logk"] = train_df_for_gnn[TARGET_COL_Y].astype(np.float32)
+    test_df_for_gnn["logk"]  = test_df_for_gnn[TARGET_COL_Y].astype(np.float32)
 
-    # IMPORTANT: shuffle=True for training
+    train_dataset = Create_Dataset(train_df_for_gnn, numerical_features)
+    scaler = train_dataset.scaler
+    test_dataset = Create_Dataset(test_df_for_gnn, numerical_features, scaler=scaler)
+    logger.info("Datasets created and features standardized (GNN).")
+
+    # ----------------------- DataLoaders -------------------------
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True,  collate_fn=collate_fn)
     test_loader  = DataLoader(test_dataset,  batch_size=8, shuffle=False, collate_fn=collate_fn)
 
+    # ----------------------- Model init --------------------------
     experimental_input_dim = train_dataset.experimental_feats.shape[1]
     model = GNNModel(22, experimental_input_dim=experimental_input_dim)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+    logger.info(f"Model initialized and moved to {device}.")
 
+    # ----------------------- Train setup -------------------------
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    logger.info("Loss function and optimizer defined (train/test only).")
 
-    # Optional label scaler (train only)
-    y_mean = None
-    y_std = None
-    if USE_LABEL_SCALER:
-        y_mean = float(train_df["logk"].mean())
-        y_std = float(train_df["logk"].std()) if float(train_df["logk"].std()) > 1e-8 else 1.0
-        logger.info(f"Using label scaling: mean={y_mean:.4f}, std={y_std:.4f}")
-
-    def _maybe_scale_targets(t):
-        if not USE_LABEL_SCALER:
-            return t
-        return (t - y_mean) / y_std
-
-    def _maybe_unscale_preds(p):
-        if not USE_LABEL_SCALER:
-            return p
-        return p * y_std + y_mean
-
-    # ------------------- Training -------------------
+    # ----------------------- Training loop -----------------------
     t_fit = time.time()
     for epoch in range(1, num_epochs + 1):
         model.train()
-        losses = []
+        train_losses = []
 
         for graphs, exp_feats, targets in train_loader:
             graphs = graphs.to(device)
@@ -393,42 +391,39 @@ def main():
             optimizer.zero_grad()
             outputs, _, _ = model(graphs, exp_feats)
 
-            # shape-safe
+            # SHAPE-SAFE LOSS (prevents silent broadcasting)
             outputs = outputs.view(-1)
             targets = targets.view(-1)
 
-            # optional scaling
-            targets_s = _maybe_scale_targets(targets)
-            outputs_s = outputs if not USE_LABEL_SCALER else (outputs - y_mean) / y_std
-
-            loss = criterion(outputs_s, targets_s)
+            loss = criterion(outputs, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            losses.append(loss.item())
+            train_losses.append(loss.item())
 
-        logger.info(f"Epoch {epoch}/{num_epochs} - Train Loss: {float(np.mean(losses)):.4f}")
+        avg_train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
+        logger.info(f"Epoch {epoch}/{num_epochs} - Train Loss: {avg_train_loss:.4f}")
 
     final_fit_seconds = time.time() - t_fit
 
-    # ------------------- Evaluation -------------------
+    # ----------------------- Evaluation (TRAIN + TEST) --------------------------
     model.eval()
-    train_pred, train_tgt, train_feats, train_graph_feats, _ = collect_predictions(train_loader, model, device, criterion)
-    test_pred,  test_tgt,  test_feats,  test_graph_feats,  _ = collect_predictions(test_loader,  model, device, criterion)
+    logger.info("Evaluating model (train/test).")
 
-    # Unscale preds/targets if needed (collect_predictions gives numpy arrays)
+    train_pred, train_tgt, train_feats, train_graph_feats, _ = collect_predictions(
+        train_loader, model, device, criterion
+    )
+    test_pred, test_tgt, test_feats, test_graph_feats, _ = collect_predictions(
+        test_loader, model, device, criterion
+    )
+
+    # Flatten
     train_pred = np.asarray(train_pred).reshape(-1)
     train_tgt  = np.asarray(train_tgt).reshape(-1)
     test_pred  = np.asarray(test_pred).reshape(-1)
     test_tgt   = np.asarray(test_tgt).reshape(-1)
 
-    if USE_LABEL_SCALER:
-        train_pred = _maybe_unscale_preds(train_pred)
-        test_pred  = _maybe_unscale_preds(test_pred)
-        train_tgt  = _maybe_unscale_preds(train_tgt)
-        test_tgt   = _maybe_unscale_preds(test_tgt)
-
-    # Save clean train/test metrics CSV
+    # ----------------------- Save GNN metrics CSV -----------------------
     gnn_metrics = [
         {"split": "Training", **_safe_metrics(train_tgt, train_pred)},
         {"split": "Test",     **_safe_metrics(test_tgt,  test_pred)},
@@ -438,16 +433,15 @@ def main():
     gnn_metrics_df.to_csv(gnn_metrics_path, index=False)
     print("Saved:", gnn_metrics_path)
 
-    # Debug: is test prediction nearly constant?
     print("Test pred mean/std:", float(test_pred.mean()), float(test_pred.std()))
 
-    # ------------------- Plots + regression stats -------------------
+    # ----------------------- Plots + regression stats ---------------------
     results = []
     dsname = []
 
     for pred, tgt, name, label in zip(
         [train_pred, test_pred],
-        [train_tgt,  test_tgt],
+        [train_tgt, test_tgt],
         ["Training", "Test"],
         [train_labels, test_labels],
     ):
@@ -456,9 +450,10 @@ def main():
         dsname.append(name)
         plot_calculated_vs_experimental(pred.flatten(), tgt.flatten(), name, label, slope, intercept)
 
-    pd.DataFrame(results, index=dsname).to_excel(f"{out_prefix}_Regression_results.xlsx")
+    results_df = pd.DataFrame(results, index=dsname)
+    results_df.to_excel(f"{out_prefix}_Regression_results.xlsx")
 
-    # PCA/UMAP combined
+    # PCA/UMAP combined (train+test)
     combined_exp_feats = np.vstack((train_feats, test_feats))
     combined_graph_feats = np.vstack((train_graph_feats, test_graph_feats))
     combined_targets = np.concatenate((train_tgt, test_tgt)).reshape(-1, 1)
@@ -468,14 +463,15 @@ def main():
     plot_umap(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", title="2D UMAP Plot", dimensions=2)
     plot_umap(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", title="3D UMAP Plot", dimensions=3)
 
-    # Williams plot: may require 3 sets; try but don’t crash
+    # Williams plot: may require 3 splits; try but don’t crash
     try:
-        dataset_dict_train = np.hstack((train_feats, train_graph_feats))
-        dataset_dict_test  = np.hstack((test_feats,  test_graph_feats))
+        dataset_train = np.hstack((train_feats, train_graph_feats))
+        dataset_test  = np.hstack((test_feats,  test_graph_feats))
+
         plot_williams(
-            dataset_dict_train,
-            dataset_dict_train,  # placeholder
-            dataset_dict_test,
+            dataset_train,
+            dataset_train,  # placeholder
+            dataset_test,
             train_pred.reshape(-1, 1),
             train_pred.reshape(-1, 1),  # placeholder
             test_pred.reshape(-1, 1),
@@ -489,7 +485,7 @@ def main():
     except Exception as e:
         logger.warning(f"Skipping Williams plot (needs 3 splits in your code): {e}")
 
-    # ------------------- Runtime CSV (GNN) -------------------
+    # ----------------------- Runtime CSV (GNN) -----------------------
     total_seconds = time.time() - t0_total
 
     gnn_rows = [{"model": "GNN", "trial_runtime_seconds": float(final_fit_seconds), "split": "train+test"}]
@@ -505,7 +501,7 @@ def main():
     gnn_out_df.to_csv(gnn_out_path, index=False)
     print("Saved:", gnn_out_path)
 
-    logger.info("Done.")
+    logger.info("All plots have been generated and saved.")
 
 
 if __name__ == "__main__":
