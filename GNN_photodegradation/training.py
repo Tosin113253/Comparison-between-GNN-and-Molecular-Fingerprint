@@ -1,20 +1,13 @@
 # training.py (COMPLETE, corrected, copy-paste)
-# CORRECTION ADDED:
-# ✅ GNN now uses SAME target transform + SAME filter as your XGB run:
-#       y = -logk
-#       keep only 0 < y < 6
-# ✅ Scaffold split applied AFTER filtering (same universe as XGB)
+# FIXED FOR YOU:
+# ✅ EXACTLY matches your XGB target logic:
+#       df["logk"] = -df["logk"]
+#       keep only 0 < df["logk"] < 6
+# ✅ Scaffold split AFTER filtering (same universe)
 # ✅ Train/Test only (no validation)
 # ✅ Baseline tabular + SHAP includes OrganicContaminant via leakage-safe TE (train-only)
-# ✅ Fixes training stability: shuffle=True + shape-safe loss + grad clipping
-# ✅ Outputs CSVs:
-#   baseline_tabular_metrics.csv
-#   baseline_tabular_feature_importance.csv
-#   baseline_tabular_shap_beeswarm.png (if SHAP works)
-#   baseline_tabular_results_with_runtime.csv
-#   GCN_gnn_metrics_train_test.csv
-#   GCN_gnn_runtime_with_total.csv
-#   GCN_Regression_results.xlsx + your plots
+# ✅ GNN training uses the SAME df["logk"] target (already negated)
+# ✅ Outputs CSVs and plots like before
 
 import os
 import random
@@ -65,14 +58,6 @@ torch.backends.cudnn.benchmark = False
 # ---------------------------------------------------------------
 
 out_prefix = "GCN"
-
-# ----------------------- Target settings (MATCH XGB) -----------------------
-# XGB used: Y_all = -dataset["logk"].values ; mask = (0 < Y_all) & (Y_all < 6)
-TARGET_COL_RAW = "logk"
-TARGET_COL_Y   = "y"          # we will create df["y"] = -df["logk"]
-Y_MIN = 0.0
-Y_MAX = 6.0
-# -------------------------------------------------------------------------
 
 
 def _safe_metrics(y_true, y_pred):
@@ -269,33 +254,30 @@ def main():
         return
 
     # ----------------------- Coerce numeric ----------------------
-    df[TARGET_COL_RAW] = pd.to_numeric(df[TARGET_COL_RAW], errors="coerce")
+    df["logk"] = pd.to_numeric(df["logk"], errors="coerce")
 
     numerical_features = ["Intensity","Wavelength","Temp","Dosage","InitialC","Humid","Reactor"]
     for col in numerical_features:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    before = len(df)
-    df = df.dropna(subset=["Smile", TARGET_COL_RAW] + numerical_features).copy()
-    after = len(df)
-    if after < before:
-        logger.info(f"Dropped {before - after} rows due to NaNs in required columns.")
-
+    df = df.dropna(subset=["Smile", "logk"] + numerical_features).copy()
     df[numerical_features] = df[numerical_features].astype(np.float32)
-    df[TARGET_COL_RAW] = df[TARGET_COL_RAW].astype(np.float32)
+    df["logk"] = df["logk"].astype(np.float32)
 
-    # ----------------------- MATCH XGB TARGET + FILTER -----------------------
-    df[TARGET_COL_Y] = (-df[TARGET_COL_RAW]).astype(np.float32)
+    # ----------------------- EXACT XGB TARGET + FILTER -----------------------
+    # XGB did: Y_all = -dataset["logk"].values ; mask = (0 < Y_all) & (Y_all < 6)
+    df["logk"] = (-df["logk"]).astype(np.float32)
 
-    mask = (df[TARGET_COL_Y].values > Y_MIN) & (df[TARGET_COL_Y].values < Y_MAX)
-    df = df.loc[mask].copy()
-    df = df.reset_index(drop=True)
-    logger.info(f"After y filter ({Y_MIN}<{TARGET_COL_Y}<{Y_MAX}): {len(df)} rows")
+    mask = (df["logk"].values > 0.0) & (df["logk"].values < 6.0)
+    df = df.loc[mask].copy().reset_index(drop=True)
+
+    logger.info(f"After XGB-style filter (0 < -logk < 6): {len(df)} rows")
+    print("After filter shape:", df.shape)
 
     # ----------------------- TRUE scaffold split on FILTERED df -----------------------
     smiles_all = df["Smile"].values
-    y_all = df[TARGET_COL_Y].values
-    X_idx = np.arange(len(df))  # placeholder indices
+    y_all = df["logk"].values                  # already NEGATED
+    X_idx = np.arange(len(df))                 # placeholder indices
 
     _, _, _, _, train_idx, test_idx = scaffold_train_test_split(
         X_idx, y_all, smiles_all, test_size=0.30, random_state=SEED, n_tries=2000
@@ -314,16 +296,16 @@ def main():
     print("Train scaffold counts (top 5):", Counter(train_scaff).most_common(5))
     print("Test  scaffold counts (top 5):", Counter(test_scaff).most_common(5))
 
-    print("Train y mean/std:", float(train_df[TARGET_COL_Y].mean()), float(train_df[TARGET_COL_Y].std()))
-    print("Test  y mean/std:", float(test_df[TARGET_COL_Y].mean()),  float(test_df[TARGET_COL_Y].std()))
+    print("Train y(mean/std):", float(train_df["logk"].mean()), float(train_df["logk"].std()))
+    print("Test  y(mean/std):", float(test_df["logk"].mean()),  float(test_df["logk"].std()))
 
     # Labels for plots (1-based)
     train_labels = np.array(train_idx) + 1
     test_labels  = np.array(test_idx) + 1
 
-    # ----------------------- Leakage-safe TE for Organic Contaminant (Smile) -----------------------
-    global_mean = float(train_df[TARGET_COL_Y].mean())
-    te_map = train_df.groupby("Smile")[TARGET_COL_Y].mean().to_dict()
+    # ----------------------- Leakage-safe TE for OrganicContaminant (Smile) -----------------------
+    global_mean = float(train_df["logk"].mean())
+    te_map = train_df.groupby("Smile")["logk"].mean().to_dict()
 
     for dfx in (train_df, test_df):
         dfx["OrganicContaminant_TE"] = dfx["Smile"].map(te_map).fillna(global_mean).astype(np.float32)
@@ -334,7 +316,7 @@ def main():
         train_df=train_df,
         test_df=test_df,
         feature_cols=baseline_feature_cols,
-        target_col=TARGET_COL_Y,
+        target_col="logk",                 # already negated target
         out_prefix="baseline_tabular",
         make_shap=True,
     )
@@ -345,22 +327,12 @@ def main():
         logger.info(f"Baseline SHAP saved: {shap_path}")
 
     # ----------------------- Create GNN datasets -----------------------
-    # NOTE: Create_Dataset likely uses 'logk' by default internally.
-    # If your Create_Dataset reads df['logk'] as target, we MUST provide it the corrected target.
-    #
-    # SAFEST FIX: overwrite logk in the df slices with our y target
-    # so your existing pipeline remains unchanged.
-    train_df_for_gnn = train_df.copy()
-    test_df_for_gnn  = test_df.copy()
-    train_df_for_gnn["logk"] = train_df_for_gnn[TARGET_COL_Y].astype(np.float32)
-    test_df_for_gnn["logk"]  = test_df_for_gnn[TARGET_COL_Y].astype(np.float32)
-
-    train_dataset = Create_Dataset(train_df_for_gnn, numerical_features)
+    # IMPORTANT: Create_Dataset reads df['logk'] as target in your pipeline.
+    # We already overwrote df['logk'] = -logk, so this is now correct.
+    train_dataset = Create_Dataset(train_df, numerical_features)
     scaler = train_dataset.scaler
-    test_dataset = Create_Dataset(test_df_for_gnn, numerical_features, scaler=scaler)
-    logger.info("Datasets created and features standardized (GNN).")
+    test_dataset = Create_Dataset(test_df, numerical_features, scaler=scaler)
 
-    # ----------------------- DataLoaders -------------------------
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True,  collate_fn=collate_fn)
     test_loader  = DataLoader(test_dataset,  batch_size=8, shuffle=False, collate_fn=collate_fn)
 
@@ -370,18 +342,15 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    logger.info(f"Model initialized and moved to {device}.")
 
-    # ----------------------- Train setup -------------------------
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    logger.info("Loss function and optimizer defined (train/test only).")
 
     # ----------------------- Training loop -----------------------
     t_fit = time.time()
     for epoch in range(1, num_epochs + 1):
         model.train()
-        train_losses = []
+        losses = []
 
         for graphs, exp_feats, targets in train_loader:
             graphs = graphs.to(device)
@@ -391,7 +360,6 @@ def main():
             optimizer.zero_grad()
             outputs, _, _ = model(graphs, exp_feats)
 
-            # SHAPE-SAFE LOSS (prevents silent broadcasting)
             outputs = outputs.view(-1)
             targets = targets.view(-1)
 
@@ -399,31 +367,22 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            train_losses.append(loss.item())
+            losses.append(loss.item())
 
-        avg_train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
-        logger.info(f"Epoch {epoch}/{num_epochs} - Train Loss: {avg_train_loss:.4f}")
+        logger.info(f"Epoch {epoch}/{num_epochs} - Train Loss: {float(np.mean(losses)):.4f}")
 
     final_fit_seconds = time.time() - t_fit
 
-    # ----------------------- Evaluation (TRAIN + TEST) --------------------------
+    # ----------------------- Evaluation --------------------------
     model.eval()
-    logger.info("Evaluating model (train/test).")
+    train_pred, train_tgt, train_feats, train_graph_feats, _ = collect_predictions(train_loader, model, device, criterion)
+    test_pred,  test_tgt,  test_feats,  test_graph_feats,  _ = collect_predictions(test_loader,  model, device, criterion)
 
-    train_pred, train_tgt, train_feats, train_graph_feats, _ = collect_predictions(
-        train_loader, model, device, criterion
-    )
-    test_pred, test_tgt, test_feats, test_graph_feats, _ = collect_predictions(
-        test_loader, model, device, criterion
-    )
-
-    # Flatten
     train_pred = np.asarray(train_pred).reshape(-1)
     train_tgt  = np.asarray(train_tgt).reshape(-1)
     test_pred  = np.asarray(test_pred).reshape(-1)
     test_tgt   = np.asarray(test_tgt).reshape(-1)
 
-    # ----------------------- Save GNN metrics CSV -----------------------
     gnn_metrics = [
         {"split": "Training", **_safe_metrics(train_tgt, train_pred)},
         {"split": "Test",     **_safe_metrics(test_tgt,  test_pred)},
@@ -450,10 +409,8 @@ def main():
         dsname.append(name)
         plot_calculated_vs_experimental(pred.flatten(), tgt.flatten(), name, label, slope, intercept)
 
-    results_df = pd.DataFrame(results, index=dsname)
-    results_df.to_excel(f"{out_prefix}_Regression_results.xlsx")
+    pd.DataFrame(results, index=dsname).to_excel(f"{out_prefix}_Regression_results.xlsx")
 
-    # PCA/UMAP combined (train+test)
     combined_exp_feats = np.vstack((train_feats, test_feats))
     combined_graph_feats = np.vstack((train_graph_feats, test_graph_feats))
     combined_targets = np.concatenate((train_tgt, test_tgt)).reshape(-1, 1)
@@ -463,34 +420,22 @@ def main():
     plot_umap(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", title="2D UMAP Plot", dimensions=2)
     plot_umap(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", title="3D UMAP Plot", dimensions=3)
 
-    # Williams plot: may require 3 splits; try but don’t crash
     try:
         dataset_train = np.hstack((train_feats, train_graph_feats))
         dataset_test  = np.hstack((test_feats,  test_graph_feats))
-
         plot_williams(
-            dataset_train,
-            dataset_train,  # placeholder
-            dataset_test,
-            train_pred.reshape(-1, 1),
-            train_pred.reshape(-1, 1),  # placeholder
-            test_pred.reshape(-1, 1),
-            train_tgt.reshape(-1, 1),
-            train_tgt.reshape(-1, 1),   # placeholder
-            test_tgt.reshape(-1, 1),
-            train_labels,
-            train_labels,               # placeholder
-            test_labels,
+            dataset_train, dataset_train, dataset_test,
+            train_pred.reshape(-1, 1), train_pred.reshape(-1, 1), test_pred.reshape(-1, 1),
+            train_tgt.reshape(-1, 1),  train_tgt.reshape(-1, 1),  test_tgt.reshape(-1, 1),
+            train_labels, train_labels, test_labels
         )
     except Exception as e:
         logger.warning(f"Skipping Williams plot (needs 3 splits in your code): {e}")
 
-    # ----------------------- Runtime CSV (GNN) -----------------------
     total_seconds = time.time() - t0_total
 
     gnn_rows = [{"model": "GNN", "trial_runtime_seconds": float(final_fit_seconds), "split": "train+test"}]
     gnn_df = pd.DataFrame(gnn_rows)
-
     final_row = {k: np.nan for k in gnn_df.columns}
     final_row["model"] = "FINAL"
     final_row["runtime/final_fit_seconds"] = float(final_fit_seconds)
@@ -501,7 +446,7 @@ def main():
     gnn_out_df.to_csv(gnn_out_path, index=False)
     print("Saved:", gnn_out_path)
 
-    logger.info("All plots have been generated and saved.")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
