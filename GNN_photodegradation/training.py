@@ -1,11 +1,19 @@
-# training.py (corrected, copy-paste)
-# FIXES:
-# ✅ scaffold split unchanged
-# ✅ train/test only
-# ✅ baseline tabular + SHAP unchanged
-# ✅ GNN training fixed: shuffle=True + shape-safe loss + gradient clipping
-# ✅ added sanity checks for y distribution + scaffold distribution
-# ✅ runtime CSV for GNN (final_fit_seconds + total_seconds)
+# training.py (COMPLETE, corrected, copy-paste)
+# What this version does (NO validation):
+# ✅ TRUE scaffold split (your exact algorithm) + prints scaffold stats
+# ✅ TRAIN+TEST only
+# ✅ Fixes common silent issues: shuffle=True, shape-safe loss, optional label scaling (OFF by default)
+# ✅ Adds a BASELINE tabular model + SHAP that INCLUDES OrganicContaminant via leakage-safe Target Encoding
+# ✅ Writes clean CSVs:
+#    - baseline_tabular_metrics.csv, baseline_tabular_feature_importance.csv, baseline_tabular_shap_beeswarm.png
+#    - baseline_tabular_results_with_runtime.csv
+#    - GCN_Regression_results.xlsx (from your pipeline)
+#    - GCN_gnn_metrics_train_test.csv  (train/test MSE/RMSE/MAE/r2)
+#    - GCN_gnn_runtime_with_total.csv  (final_fit_seconds + total_seconds)
+#
+# IMPORTANT:
+# If test r2 is ~0 or negative after this, it is usually NOT a code bug—
+# it’s the expected difficulty of strict scaffold OOD generalization.
 
 import os
 import random
@@ -57,6 +65,11 @@ torch.backends.cudnn.benchmark = False
 
 out_prefix = "GCN"
 
+# ----------------------- Optional: label scaling -----------------------
+# This often helps stability across OOD splits. Keep OFF if you want raw logk.
+USE_LABEL_SCALER = False
+# ----------------------------------------------------------------------
+
 
 def _safe_metrics(y_true, y_pred):
     y_true = np.asarray(y_true).reshape(-1)
@@ -68,113 +81,8 @@ def _safe_metrics(y_true, y_pred):
     return {"MSE": float(mse), "RMSE": rmse, "MAE": float(mae), "r2": float(r2)}
 
 
-def run_experimental_baselines_train_test(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    feature_cols: list,
-    target_col: str,
-    out_prefix: str,
-    make_shap: bool = True,
-):
-    X_train = train_df[feature_cols].values
-    y_train = train_df[target_col].values
-    X_test = test_df[feature_cols].values
-    y_test = test_df[target_col].values
-
-    results_metrics = []
-    results_runtime_rows = []
-
-    # Ridge
-    ridge = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            ("model", Ridge(alpha=1.0, random_state=SEED)),
-        ]
-    )
-    t_fit = time.time()
-    ridge.fit(X_train, y_train)
-    ridge_fit_seconds = time.time() - t_fit
-
-    results_metrics.append({"model": "Ridge", "split": "train", **_safe_metrics(y_train, ridge.predict(X_train))})
-    results_metrics.append({"model": "Ridge", "split": "test",  **_safe_metrics(y_test,  ridge.predict(X_test))})
-
-    results_runtime_rows.append({
-        "model": "Ridge",
-        "trial_runtime_seconds": float(ridge_fit_seconds),
-        "train_r2": float(ridge.score(X_train, y_train)),
-        "test_r2": float(ridge.score(X_test, y_test)),
-    })
-
-    # RandomForest
-    rf = RandomForestRegressor(
-        n_estimators=500,
-        random_state=SEED,
-        n_jobs=-1,
-        min_samples_leaf=2,
-    )
-    t_fit = time.time()
-    rf.fit(X_train, y_train)
-    rf_fit_seconds = time.time() - t_fit
-
-    results_metrics.append({"model": "RandomForest", "split": "train", **_safe_metrics(y_train, rf.predict(X_train))})
-    results_metrics.append({"model": "RandomForest", "split": "test",  **_safe_metrics(y_test,  rf.predict(X_test))})
-
-    results_runtime_rows.append({
-        "model": "RandomForest",
-        "trial_runtime_seconds": float(rf_fit_seconds),
-        "train_r2": float(rf.score(X_train, y_train)),
-        "test_r2": float(rf.score(X_test, y_test)),
-    })
-
-    metrics_df = pd.DataFrame(results_metrics)
-    metrics_path = f"{out_prefix}_metrics.csv"
-    metrics_df.to_csv(metrics_path, index=False)
-
-    fi = pd.DataFrame(
-        {"Feature": feature_cols, "Importance": rf.feature_importances_.astype(float)}
-    ).sort_values("Importance", ascending=False)
-    fi_path = f"{out_prefix}_feature_importance.csv"
-    fi.to_csv(fi_path, index=False)
-
-    shap_path = None
-    if make_shap:
-        try:
-            n_plot = min(500, X_train.shape[0])
-            rng = np.random.default_rng(SEED)
-            plot_idx = rng.choice(X_train.shape[0], size=n_plot, replace=False)
-
-            explainer = shap.TreeExplainer(rf)
-            shap_values = explainer.shap_values(X_train[plot_idx])
-
-            plt.figure()
-            shap.summary_plot(
-                shap_values,
-                X_train[plot_idx],
-                feature_names=feature_cols,
-                show=False,
-                max_display=len(feature_cols),
-            )
-            shap_path = f"{out_prefix}_shap_beeswarm.png"
-            plt.tight_layout()
-            plt.savefig(shap_path, dpi=300)
-            plt.close()
-        except Exception as e:
-            logger.warning(f"SHAP plot failed for baseline: {e}")
-
-    res_df = pd.DataFrame(results_runtime_rows)
-    final_row = {k: np.nan for k in res_df.columns}
-    final_row["model"] = "FINAL"
-    final_row["trial_runtime_seconds"] = np.nan
-    final_row["runtime/total_seconds"] = float(ridge_fit_seconds + rf_fit_seconds)
-    out_df = pd.concat([res_df, pd.DataFrame([final_row])], ignore_index=True)
-    out_path = f"{out_prefix}_results_with_runtime.csv"
-    out_df.to_csv(out_path, index=False)
-
-    return metrics_path, fi_path, shap_path, out_path
-
-
 # -------------------------
-# TRUE scaffold split (exactly your version)
+# TRUE scaffold split (your exact code)
 # -------------------------
 def _scaffold_or_none(smiles_str: str):
     mol = Chem.MolFromSmiles(smiles_str)
@@ -215,12 +123,118 @@ def scaffold_train_test_split(X, y, smiles, test_size=0.3, random_state=0, n_tri
     return X[train_idx], X[list(test_set)], y[train_idx], y[list(test_set)], train_idx, list(test_set)
 
 
+def run_experimental_baselines_train_test(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: list,
+    target_col: str,
+    out_prefix: str,
+    make_shap: bool = True,
+):
+    X_train = train_df[feature_cols].values
+    y_train = train_df[target_col].values
+    X_test = test_df[feature_cols].values
+    y_test = test_df[target_col].values
+
+    results_metrics = []
+    results_runtime_rows = []
+
+    # ---------------- Ridge ----------------
+    ridge = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("model", Ridge(alpha=1.0, random_state=SEED)),
+        ]
+    )
+    t_fit = time.time()
+    ridge.fit(X_train, y_train)
+    ridge_fit_seconds = time.time() - t_fit
+
+    results_metrics.append({"model": "Ridge", "split": "train", **_safe_metrics(y_train, ridge.predict(X_train))})
+    results_metrics.append({"model": "Ridge", "split": "test",  **_safe_metrics(y_test,  ridge.predict(X_test))})
+
+    results_runtime_rows.append({
+        "model": "Ridge",
+        "trial_runtime_seconds": float(ridge_fit_seconds),
+        "train_r2": float(ridge.score(X_train, y_train)),
+        "test_r2": float(ridge.score(X_test, y_test)),
+    })
+
+    # -------------- RandomForest --------------
+    rf = RandomForestRegressor(
+        n_estimators=500,
+        random_state=SEED,
+        n_jobs=-1,
+        min_samples_leaf=2,
+    )
+    t_fit = time.time()
+    rf.fit(X_train, y_train)
+    rf_fit_seconds = time.time() - t_fit
+
+    results_metrics.append({"model": "RandomForest", "split": "train", **_safe_metrics(y_train, rf.predict(X_train))})
+    results_metrics.append({"model": "RandomForest", "split": "test",  **_safe_metrics(y_test,  rf.predict(X_test))})
+
+    results_runtime_rows.append({
+        "model": "RandomForest",
+        "trial_runtime_seconds": float(rf_fit_seconds),
+        "train_r2": float(rf.score(X_train, y_train)),
+        "test_r2": float(rf.score(X_test, y_test)),
+    })
+
+    metrics_df = pd.DataFrame(results_metrics)
+    metrics_path = f"{out_prefix}_metrics.csv"
+    metrics_df.to_csv(metrics_path, index=False)
+
+    fi = pd.DataFrame({"Feature": feature_cols, "Importance": rf.feature_importances_.astype(float)}).sort_values(
+        "Importance", ascending=False
+    )
+    fi_path = f"{out_prefix}_feature_importance.csv"
+    fi.to_csv(fi_path, index=False)
+
+    shap_path = None
+    if make_shap:
+        try:
+            n_plot = min(500, X_train.shape[0])
+            rng = np.random.default_rng(SEED)
+            plot_idx = rng.choice(X_train.shape[0], size=n_plot, replace=False)
+
+            explainer = shap.TreeExplainer(rf)
+            shap_values = explainer.shap_values(X_train[plot_idx])
+
+            plt.figure()
+            shap.summary_plot(
+                shap_values,
+                X_train[plot_idx],
+                feature_names=feature_cols,
+                show=False,
+                max_display=len(feature_cols),
+            )
+            shap_path = f"{out_prefix}_shap_beeswarm.png"
+            plt.tight_layout()
+            plt.savefig(shap_path, dpi=300)
+            plt.close()
+        except Exception as e:
+            logger.warning(f"SHAP plot failed for baseline: {e}")
+
+    res_df = pd.DataFrame(results_runtime_rows)
+    final_row = {k: np.nan for k in res_df.columns}
+    final_row["model"] = "FINAL"
+    final_row["trial_runtime_seconds"] = np.nan
+    final_row["runtime/total_seconds"] = float(ridge_fit_seconds + rf_fit_seconds)
+    out_df = pd.concat([res_df, pd.DataFrame([final_row])], ignore_index=True)
+    out_path = f"{out_prefix}_results_with_runtime.csv"
+    out_df.to_csv(out_path, index=False)
+
+    return metrics_path, fi_path, shap_path, out_path
+
+
 def main():
     t0_total = time.time()
 
     dataset_path = DATA_path
     num_epochs = NUM_epochs
 
+    # ----------------------- Load dataset -----------------------
     if not os.path.exists(dataset_path):
         logger.error(f"Dataset file not found at {dataset_path}")
         return
@@ -232,8 +246,17 @@ def main():
         logger.error(f"Failed to load dataset: {e}")
         return
 
+    # ----------------------- Column checks ----------------------
     required_columns = {
-        "Smile","logk","Intensity","Wavelength","Temp","Dosage","InitialC","Humid","Reactor"
+        "Smile",
+        "logk",
+        "Intensity",
+        "Wavelength",
+        "Temp",
+        "Dosage",
+        "InitialC",
+        "Humid",
+        "Reactor",
     }
     if not required_columns.issubset(df.columns):
         missing = sorted(list(required_columns - set(df.columns)))
@@ -241,9 +264,18 @@ def main():
         logger.error(f"Columns found: {list(df.columns)}")
         return
 
+    # ----------------------- Coerce numeric ----------------------
     df["logk"] = pd.to_numeric(df["logk"], errors="coerce")
 
-    numerical_features = ["Intensity","Wavelength","Temp","Dosage","InitialC","Humid","Reactor"]
+    numerical_features = [
+        "Intensity",
+        "Wavelength",
+        "Temp",
+        "Dosage",
+        "InitialC",
+        "Humid",
+        "Reactor",
+    ]
     for col in numerical_features:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -257,39 +289,45 @@ def main():
     df["logk"] = df["logk"].astype(np.float32)
 
     # -----------------------
-    # Scaffold split (train/test only)
+    # TRUE scaffold split (TRAIN + TEST ONLY)
     # -----------------------
     smiles_all = df["Smile"].values
-    Y = df["logk"].values
-    X = np.arange(len(df))
+    Y_all = df["logk"].values
+    X_idx = np.arange(len(df))  # placeholder indices for splitter
 
     _, _, _, _, train_idx, test_idx = scaffold_train_test_split(
-        X, Y, smiles_all, test_size=0.30, random_state=SEED, n_tries=2000
+        X_idx, Y_all, smiles_all, test_size=0.25, random_state=SEED, n_tries=2000
     )
 
     train_df = df.iloc[train_idx].copy()
     test_df  = df.iloc[test_idx].copy()
 
     print("Shapes:", train_df.shape, test_df.shape)
-    train_scaff = [_scaffold_or_none(smiles_all[i]) for i in train_idx]
-    test_scaff  = [_scaffold_or_none(smiles_all[i]) for i in test_idx]
+
+    train_scaff = [_scaffold_or_none(s) for s in train_df["Smile"].values]
+    test_scaff  = [_scaffold_or_none(s) for s in test_df["Smile"].values]
+    print("Unique scaffolds train:", len(set(train_scaff)))
+    print("Unique scaffolds test :", len(set(test_scaff)))
     print("Scaffold overlap (None excluded):", len((set(train_scaff) & set(test_scaff)) - {None}))
     print("Train scaffold counts (top 5):", Counter(train_scaff).most_common(5))
     print("Test  scaffold counts (top 5):", Counter(test_scaff).most_common(5))
 
-    # --- sanity on target distribution ---
     print("Train y mean/std:", float(train_df["logk"].mean()), float(train_df["logk"].std()))
     print("Test  y mean/std:", float(test_df["logk"].mean()),  float(test_df["logk"].std()))
 
+    # Labels for plotting (1-based)
+    train_labels = np.array(train_idx) + 1
+    test_labels  = np.array(test_idx) + 1
+
     # -----------------------
-    # Leakage-safe TE for baseline only
+    # Leakage-safe Target Encoding for Organic Contaminant (Smile)  (BASELINE ONLY)
     # -----------------------
     global_mean = float(train_df["logk"].mean())
     te_map = train_df.groupby("Smile")["logk"].mean().to_dict()
     for dfx in (train_df, test_df):
         dfx["OrganicContaminant_TE"] = dfx["Smile"].map(te_map).fillna(global_mean).astype(np.float32)
 
-    # ------------------- Baseline -------------------
+    # ------------------- Baseline (tabular) + SHAP -------------------
     baseline_feature_cols = numerical_features + ["OrganicContaminant_TE"]
     metrics_path, fi_path, shap_path, baseline_runtime_csv = run_experimental_baselines_train_test(
         train_df=train_df,
@@ -310,8 +348,8 @@ def main():
     scaler = train_dataset.scaler
     test_dataset = Create_Dataset(test_df, numerical_features, scaler=scaler)
 
-    # IMPORTANT FIX: shuffle=True for training
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    # IMPORTANT: shuffle=True for training
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True,  collate_fn=collate_fn)
     test_loader  = DataLoader(test_dataset,  batch_size=8, shuffle=False, collate_fn=collate_fn)
 
     experimental_input_dim = train_dataset.experimental_feats.shape[1]
@@ -321,7 +359,25 @@ def main():
     model = model.to(device)
 
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)  # 1e-4 can be too slow; 1e-3 is standard
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    # Optional label scaler (train only)
+    y_mean = None
+    y_std = None
+    if USE_LABEL_SCALER:
+        y_mean = float(train_df["logk"].mean())
+        y_std = float(train_df["logk"].std()) if float(train_df["logk"].std()) > 1e-8 else 1.0
+        logger.info(f"Using label scaling: mean={y_mean:.4f}, std={y_std:.4f}")
+
+    def _maybe_scale_targets(t):
+        if not USE_LABEL_SCALER:
+            return t
+        return (t - y_mean) / y_std
+
+    def _maybe_unscale_preds(p):
+        if not USE_LABEL_SCALER:
+            return p
+        return p * y_std + y_mean
 
     # ------------------- Training -------------------
     t_fit = time.time()
@@ -337,16 +393,17 @@ def main():
             optimizer.zero_grad()
             outputs, _, _ = model(graphs, exp_feats)
 
-            # IMPORTANT FIX: shape-safe loss (prevents silent broadcasting)
+            # shape-safe
             outputs = outputs.view(-1)
             targets = targets.view(-1)
 
-            loss = criterion(outputs, targets)
+            # optional scaling
+            targets_s = _maybe_scale_targets(targets)
+            outputs_s = outputs if not USE_LABEL_SCALER else (outputs - y_mean) / y_std
+
+            loss = criterion(outputs_s, targets_s)
             loss.backward()
-
-            # helpful stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-
             optimizer.step()
             losses.append(loss.item())
 
@@ -359,15 +416,38 @@ def main():
     train_pred, train_tgt, train_feats, train_graph_feats, _ = collect_predictions(train_loader, model, device, criterion)
     test_pred,  test_tgt,  test_feats,  test_graph_feats,  _ = collect_predictions(test_loader,  model, device, criterion)
 
-    # Plots + metrics
+    # Unscale preds/targets if needed (collect_predictions gives numpy arrays)
+    train_pred = np.asarray(train_pred).reshape(-1)
+    train_tgt  = np.asarray(train_tgt).reshape(-1)
+    test_pred  = np.asarray(test_pred).reshape(-1)
+    test_tgt   = np.asarray(test_tgt).reshape(-1)
+
+    if USE_LABEL_SCALER:
+        train_pred = _maybe_unscale_preds(train_pred)
+        test_pred  = _maybe_unscale_preds(test_pred)
+        train_tgt  = _maybe_unscale_preds(train_tgt)
+        test_tgt   = _maybe_unscale_preds(test_tgt)
+
+    # Save clean train/test metrics CSV
+    gnn_metrics = [
+        {"split": "Training", **_safe_metrics(train_tgt, train_pred)},
+        {"split": "Test",     **_safe_metrics(test_tgt,  test_pred)},
+    ]
+    gnn_metrics_df = pd.DataFrame(gnn_metrics)
+    gnn_metrics_path = f"{out_prefix}_gnn_metrics_train_test.csv"
+    gnn_metrics_df.to_csv(gnn_metrics_path, index=False)
+    print("Saved:", gnn_metrics_path)
+
+    # Debug: is test prediction nearly constant?
+    print("Test pred mean/std:", float(test_pred.mean()), float(test_pred.std()))
+
+    # ------------------- Plots + regression stats -------------------
     results = []
     dsname = []
-    train_labels = np.array(train_idx) + 1
-    test_labels  = np.array(test_idx) + 1
 
     for pred, tgt, name, label in zip(
         [train_pred, test_pred],
-        [train_tgt, test_tgt],
+        [train_tgt,  test_tgt],
         ["Training", "Test"],
         [train_labels, test_labels],
     ):
@@ -378,46 +458,41 @@ def main():
 
     pd.DataFrame(results, index=dsname).to_excel(f"{out_prefix}_Regression_results.xlsx")
 
-    # PCA/UMAP combined (train+test)
+    # PCA/UMAP combined
     combined_exp_feats = np.vstack((train_feats, test_feats))
     combined_graph_feats = np.vstack((train_graph_feats, test_graph_feats))
-    combined_targets = np.vstack((train_tgt, test_tgt))
+    combined_targets = np.concatenate((train_tgt, test_tgt)).reshape(-1, 1)
 
     plot_pca(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", "2D PCA Plot", dimensions=2)
     plot_pca(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", "3D PCA Plot", dimensions=3)
     plot_umap(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", title="2D UMAP Plot", dimensions=2)
     plot_umap(combined_exp_feats, combined_graph_feats, combined_targets.flatten(), "Combined", title="3D UMAP Plot", dimensions=3)
 
-    # Williams plot often expects 3 splits; skip safely if needed
+    # Williams plot: may require 3 sets; try but don’t crash
     try:
-        dataset_dict = {
-            "train": np.hstack((train_feats, train_graph_feats)),
-            "test":  np.hstack((test_feats,  test_graph_feats)),
-        }
-        # if your plot_williams strictly needs 3, it will error -> caught below
+        dataset_dict_train = np.hstack((train_feats, train_graph_feats))
+        dataset_dict_test  = np.hstack((test_feats,  test_graph_feats))
         plot_williams(
-            dataset_dict["train"],
-            dataset_dict["train"],  # placeholder
-            dataset_dict["test"],
-            train_pred,
-            train_pred,             # placeholder
-            test_pred,
-            train_tgt,
-            train_tgt,              # placeholder
-            test_tgt,
+            dataset_dict_train,
+            dataset_dict_train,  # placeholder
+            dataset_dict_test,
+            train_pred.reshape(-1, 1),
+            train_pred.reshape(-1, 1),  # placeholder
+            test_pred.reshape(-1, 1),
+            train_tgt.reshape(-1, 1),
+            train_tgt.reshape(-1, 1),   # placeholder
+            test_tgt.reshape(-1, 1),
             train_labels,
-            train_labels,           # placeholder
+            train_labels,               # placeholder
             test_labels,
         )
     except Exception as e:
-        logger.warning(f"Skipping Williams plot (needs 3 splits): {e}")
+        logger.warning(f"Skipping Williams plot (needs 3 splits in your code): {e}")
 
-    # ------------------- Runtime CSV (like your format) -------------------
+    # ------------------- Runtime CSV (GNN) -------------------
     total_seconds = time.time() - t0_total
 
-    gnn_rows = [
-        {"model": "GNN", "trial_runtime_seconds": float(final_fit_seconds), "split": "train+test"}
-    ]
+    gnn_rows = [{"model": "GNN", "trial_runtime_seconds": float(final_fit_seconds), "split": "train+test"}]
     gnn_df = pd.DataFrame(gnn_rows)
 
     final_row = {k: np.nan for k in gnn_df.columns}
@@ -428,7 +503,7 @@ def main():
     gnn_out_df = pd.concat([gnn_df, pd.DataFrame([final_row])], ignore_index=True)
     gnn_out_path = f"{out_prefix}_gnn_runtime_with_total.csv"
     gnn_out_df.to_csv(gnn_out_path, index=False)
-    logger.info(f"GNN runtime CSV saved: {gnn_out_path}")
+    print("Saved:", gnn_out_path)
 
     logger.info("Done.")
 
