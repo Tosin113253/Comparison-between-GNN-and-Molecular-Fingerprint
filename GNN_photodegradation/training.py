@@ -1,11 +1,10 @@
-# training.py (COMPLETE, copy-paste)
-# Fixes:
-# ✅ EXACT XGB target: df["logk"] = -df["logk"]; keep 0 < logk < 6
-# ✅ TRUE scaffold split on filtered df
-# ✅ Uses a small INTERNAL val split from TRAIN ONLY for early stopping (test untouched)
-# ✅ Reports only TRAIN + TEST metrics (as you want)
-# ✅ Adds target sanity-check: verifies Create_Dataset targets match df["logk"]
-# ✅ Saves/loads best epoch by val loss (prevents overfit disaster)
+# training.py (COMPLETE, crash-proof, copy-paste)
+# Fix:
+# ✅ Explains why train_df became empty (prints row counts + target range)
+# ✅ Guards for empty after filtering/splitting
+# ✅ If train too small -> no validation split (still trains)
+# ✅ Still uses EXACT XGB target: logk := -logk ; keep 0<logk<6
+# ✅ True scaffold split unchanged
 
 import os
 import random
@@ -33,7 +32,6 @@ from GNN_photodegradation.get_logger import get_logger
 
 logger = get_logger()
 
-# ----------------------- Reproducibility -----------------------
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -41,10 +39,8 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-# ---------------------------------------------------------------
 
 OUT_PREFIX = "GCN"
-
 NUM_FEATS = ["Intensity","Wavelength","Temp","Dosage","InitialC","Humid","Reactor"]
 
 def _safe_metrics(y_true, y_pred):
@@ -98,34 +94,44 @@ def scaffold_train_test_split(X, y, smiles, test_size=0.3, random_state=0, n_tri
     return X[train_idx], X[list(test_set)], y[train_idx], y[list(test_set)], train_idx, list(test_set)
 
 def main():
-    t0_total = time.time()
+    t0 = time.time()
 
-    # ----------------------- Load dataset -----------------------
+    # ----------------------- Load -----------------------
     if not os.path.exists(DATA_path):
         raise FileNotFoundError(f"DATA_path not found: {DATA_path}")
 
     df = pd.read_excel(DATA_path)
-    logger.info(f"Loaded {len(df)} rows.")
+    print("Loaded shape:", df.shape)
 
     # ----------------------- Clean numeric -----------------------
     df["logk"] = pd.to_numeric(df["logk"], errors="coerce")
     for c in NUM_FEATS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    before = len(df)
     df = df.dropna(subset=["Smile","logk"] + NUM_FEATS).copy()
+    print("After dropna:", df.shape, "| dropped:", before - len(df))
+
     df[NUM_FEATS] = df[NUM_FEATS].astype(np.float32)
     df["logk"] = df["logk"].astype(np.float32)
 
-    # ----------------------- EXACT XGB TARGET + FILTER -----------------------
-    # XGB: Y_all = -logk ; mask = (0<Y_all<6)
+    # ----------------------- EXACT XGB target + filter -----------------------
+    # XGB: Y_all = -logk ; keep 0<Y<6
     df["logk"] = (-df["logk"]).astype(np.float32)
+
+    print("After negation logk min/max:", float(df["logk"].min()), float(df["logk"].max()))
+
     mask = (df["logk"].values > 0.0) & (df["logk"].values < 6.0)
     df = df.loc[mask].copy().reset_index(drop=True)
 
-    print("After XGB-style filter shape:", df.shape)
-    print("Target (logk) min/max:", float(df["logk"].min()), float(df["logk"].max()))
+    print("After filter (0<logk<6) shape:", df.shape)
+    if len(df) == 0:
+        raise ValueError(
+            "After applying the XGB filter (0 < -logk < 6), df became empty. "
+            "This means your dataset has no rows satisfying that condition."
+        )
 
-    # ----------------------- Scaffold split (filtered universe) -----------------------
+    # ----------------------- Scaffold split -----------------------
     smiles_all = df["Smile"].values
     y_all = df["logk"].values
     X_idx = np.arange(len(df))
@@ -133,6 +139,13 @@ def main():
     _, _, _, _, train_idx, test_idx = scaffold_train_test_split(
         X_idx, y_all, smiles_all, test_size=0.30, random_state=SEED, n_tries=2000
     )
+
+    print("Split sizes:", len(train_idx), len(test_idx))
+    if len(train_idx) == 0 or len(test_idx) == 0:
+        raise ValueError(
+            f"Scaffold split produced empty set(s). train={len(train_idx)}, test={len(test_idx)}. "
+            "This can happen if there are too few scaffolds or too few samples after filtering."
+        )
 
     train_df = df.iloc[train_idx].copy().reset_index(drop=True)
     test_df  = df.iloc[test_idx].copy().reset_index(drop=True)
@@ -144,50 +157,33 @@ def main():
     print("Scaffold overlap (None excluded):", len((set(train_scaff) & set(test_scaff)) - {None}))
     print("Unique scaffolds train/test:", len(set(train_scaff)), len(set(test_scaff)))
 
-    print("Train y mean/std:", float(train_df["logk"].mean()), float(train_df["logk"].std()))
-    print("Test  y mean/std:", float(test_df["logk"].mean()),  float(test_df["logk"].std()))
+    # ----------------------- Optional internal val split (TRAIN ONLY) -----------------------
+    # Only do this if train is big enough.
+    use_val = len(train_df) >= 30  # threshold to avoid tiny/empty splits
+    if use_val:
+        tr_df, val_df = train_test_split(train_df, test_size=0.15, random_state=SEED)
+        tr_df = tr_df.copy().reset_index(drop=True)
+        val_df = val_df.copy().reset_index(drop=True)
+        print("Internal train/val sizes:", len(tr_df), len(val_df))
+    else:
+        tr_df = train_df
+        val_df = None
+        print("Skipping internal validation split (train too small).")
 
-    # -----------------------
-    # INTERNAL val split from TRAIN ONLY (for early stopping)
-    # -----------------------
-    tr_df, val_df = train_test_split(train_df, test_size=0.15, random_state=SEED)
-    tr_df = tr_df.copy().reset_index(drop=True)
-    val_df = val_df.copy().reset_index(drop=True)
-
-    # ----------------------- Create datasets -----------------------
-    # NOTE: Create_Dataset reads df["logk"] as target.
-    tr_dataset  = Create_Dataset(tr_df,  NUM_FEATS)
+    # ----------------------- Datasets -----------------------
+    tr_dataset = Create_Dataset(tr_df, NUM_FEATS)
     scaler = tr_dataset.scaler
-    val_dataset = Create_Dataset(val_df, NUM_FEATS, scaler=scaler)
-    te_dataset  = Create_Dataset(test_df, NUM_FEATS, scaler=scaler)
 
-    # ----------------------- TARGET SANITY CHECK -----------------------
-    # We must ensure Create_Dataset targets match df["logk"] (negated + filtered).
-    # This catches hidden transforms in Create_Dataset.
-    try:
-        # try common attribute names
-        if hasattr(tr_dataset, "targets"):
-            ds_t = np.asarray(tr_dataset.targets).reshape(-1)
-        elif hasattr(tr_dataset, "y"):
-            ds_t = np.asarray(tr_dataset.y).reshape(-1)
-        else:
-            ds_t = None
+    tr_loader = DataLoader(tr_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn)
 
-        if ds_t is not None:
-            raw_t = tr_df["logk"].values.reshape(-1)
-            print("Sanity check targets (first 5):")
-            print("df['logk']:", raw_t[:5])
-            print("dataset  :", ds_t[:5])
-            print("Target abs diff mean:", float(np.mean(np.abs(raw_t - ds_t))))
-        else:
-            print("NOTE: Could not auto-read dataset targets attribute; skipping sanity check.")
-    except Exception as e:
-        print("Sanity check failed:", e)
+    if val_df is not None:
+        val_dataset = Create_Dataset(val_df, NUM_FEATS, scaler=scaler)
+        val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
+    else:
+        val_loader = None
 
-    # ----------------------- DataLoaders -----------------------
-    tr_loader  = DataLoader(tr_dataset,  batch_size=16, shuffle=True,  collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
-    te_loader  = DataLoader(te_dataset,  batch_size=16, shuffle=False, collate_fn=collate_fn)
+    te_dataset = Create_Dataset(test_df, NUM_FEATS, scaler=scaler)
+    te_loader = DataLoader(te_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
 
     # ----------------------- Model -----------------------
     experimental_input_dim = tr_dataset.experimental_feats.shape[1]
@@ -199,16 +195,16 @@ def main():
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    # ----------------------- Train with early stopping (val from train only) -----------------------
-    best_val = float("inf")
+    # ----------------------- Train (with early stopping only if val exists) -----------------------
     best_path = "best_gnn.pth"
+    best_val = float("inf")
     patience = 30
     bad = 0
 
     t_fit = time.time()
     for epoch in range(1, NUM_epochs + 1):
         model.train()
-        tr_losses = []
+        losses = []
 
         for graphs, exp_feats, targets in tr_loader:
             graphs = graphs.to(device)
@@ -225,11 +221,17 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            tr_losses.append(loss.item())
+            losses.append(loss.item())
 
-        tr_loss = float(np.mean(tr_losses)) if tr_losses else float("nan")
+        tr_loss = float(np.mean(losses)) if losses else float("nan")
 
-        # val loss
+        if val_loader is None:
+            # no validation -> just save last epoch
+            torch.save(model.state_dict(), best_path)
+            logger.info(f"Epoch {epoch}/{NUM_epochs} train_loss={tr_loss:.4f}")
+            continue
+
+        # validation loss
         model.eval()
         v_losses = []
         with torch.no_grad():
@@ -244,7 +246,7 @@ def main():
                 v_losses.append(criterion(out, targets).item())
 
         v_loss = float(np.mean(v_losses)) if v_losses else float("nan")
-        logger.info(f"Epoch {epoch}/{NUM_epochs} | train_loss={tr_loss:.4f} | val_loss={v_loss:.4f}")
+        logger.info(f"Epoch {epoch}/{NUM_epochs} train_loss={tr_loss:.4f} val_loss={v_loss:.4f}")
 
         if v_loss < best_val:
             best_val = v_loss
@@ -258,7 +260,7 @@ def main():
 
     fit_seconds = time.time() - t_fit
 
-    # ----------------------- Evaluate using BEST epoch -----------------------
+    # ----------------------- Evaluate -----------------------
     model.load_state_dict(torch.load(best_path, map_location=device))
     model.eval()
 
@@ -270,7 +272,6 @@ def main():
     te_pred = np.asarray(te_pred).reshape(-1)
     te_tgt  = np.asarray(te_tgt).reshape(-1)
 
-    # extra debug prints (very important)
     print("Pred stats:")
     print("Train pred mean/std:", float(tr_pred.mean()), float(tr_pred.std()))
     print("Test  pred mean/std:", float(te_pred.mean()), float(te_pred.std()))
@@ -289,13 +290,16 @@ def main():
     print("Saved:", metrics_path)
     print(metrics_df)
 
-    # runtime csv
-    total_seconds = time.time() - t0_total
-    rt = pd.DataFrame([
-        {"model": "GNN", "fit_seconds": fit_seconds, "total_seconds": total_seconds, "best_val_loss": best_val}
-    ])
+    runtime_df = pd.DataFrame([{
+        "fit_seconds": float(fit_seconds),
+        "total_seconds": float(time.time() - t0),
+        "best_val_loss": (float(best_val) if val_loader is not None else np.nan),
+        "n_train": int(len(train_df)),
+        "n_test": int(len(test_df)),
+        "n_filtered_total": int(len(df)),
+    }])
     rt_path = f"{OUT_PREFIX}_gnn_runtime_with_total.csv"
-    rt.to_csv(rt_path, index=False)
+    runtime_df.to_csv(rt_path, index=False)
     print("Saved:", rt_path)
 
 if __name__ == "__main__":
