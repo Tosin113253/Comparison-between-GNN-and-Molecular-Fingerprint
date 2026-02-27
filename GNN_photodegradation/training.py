@@ -1,9 +1,8 @@
-# training.py (COMPLETE, copy-paste)
-# Fixes:
-# ✅ EXACT XGB target: df["logk"] = -df["logk"]; keep 0<logk<6
-# ✅ Robust scaffold train/val/test split (no overlap) AND guarantees non-empty splits
-# ✅ Handles None/EMPTY scaffolds safely (keeps them in TRAIN by default)
-# ✅ Prevents train_df=0 and StandardScaler crash
+# training.py (COMPLETE, train/test only, XGB-style)
+# ✅ NO validation
+# ✅ EXACT XGB target: logk := -logk ; keep 0<logk<6
+# ✅ TRUE scaffold split (no overlap) with safety for EMPTY/INVALID scaffolds
+# ✅ Saves metrics + runtime to CSV
 
 import os
 import random
@@ -17,7 +16,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
@@ -51,110 +49,63 @@ def _safe_metrics(y_true, y_pred):
     r2 = r2_score(y_true, y_pred)
     return {"MSE": float(mse), "RMSE": rmse, "MAE": float(mae), "r2": float(r2)}
 
-def _scaffold(smiles_str: str):
+# -------------------------
+# TRUE scaffold split (your code) + small safety for EMPTY scaffolds
+# -------------------------
+def _scaffold_or_none(smiles_str: str):
     mol = Chem.MolFromSmiles(smiles_str)
     if mol is None:
         return "INVALID_SMILES"
     scaf = MurckoScaffold.MurckoScaffoldSmiles(mol=mol)
-    if scaf is None or scaf == "":
-        return "EMPTY_SCAFFOLD"
-    return scaf
+    return scaf if scaf else "EMPTY_SCAFFOLD"
 
-def robust_scaffold_split_indices(smiles, frac_train=0.70, frac_val=0.15, frac_test=0.15, random_state=42):
-    """
-    Robust scaffold split:
-    - NO scaffold overlap across splits
-    - Guarantees non-empty splits when possible
-    - Keeps EMPTY/INVALID scaffolds in TRAIN by default (prevents train collapse)
-    """
-    assert abs(frac_train + frac_val + frac_test - 1.0) < 1e-6
-    n = len(smiles)
-    if n < 3:
-        raise ValueError("Dataset too small for train/val/test split.")
-
+def scaffold_train_test_split(X, y, smiles, test_size=0.3, random_state=0, n_tries=2000):
     scaffold_to_idx = defaultdict(list)
     for i, smi in enumerate(smiles):
-        scaffold_to_idx[_scaffold(smi)].append(i)
+        scaffold_to_idx[_scaffold_or_none(smi)].append(i)
 
-    # Force bad/empty scaffolds into TRAIN first
+    # IMPORTANT: keep EMPTY/INVALID scaffolds in TRAIN (prevents weird leakage + tiny test)
     forced_train_scaffolds = {"EMPTY_SCAFFOLD", "INVALID_SMILES"}
-    forced_train_idx = []
-    remaining_scaffolds = []
-    for scaf, idxs in scaffold_to_idx.items():
-        if scaf in forced_train_scaffolds:
-            forced_train_idx.extend(idxs)
-        else:
-            remaining_scaffolds.append(scaf)
+    normal_scaffolds = [s for s in scaffold_to_idx.keys() if s not in forced_train_scaffolds]
+
+    target = int(len(smiles) * test_size)
+    best_test_idx = None
+    best_gap = float("inf")
 
     rng = np.random.default_rng(random_state)
-    rng.shuffle(remaining_scaffolds)
+    for _ in range(n_tries):
+        rng.shuffle(normal_scaffolds)
+        test_idx = []
+        for scaf in normal_scaffolds:
+            test_idx.extend(scaffold_to_idx[scaf])
+            if len(test_idx) >= target:
+                break
 
-    n_test_target = max(1, int(frac_test * n))
-    n_val_target  = max(1, int(frac_val * n))
+        gap = abs(len(test_idx) - target)
+        if gap < best_gap and len(test_idx) > 0:
+            best_gap = gap
+            best_test_idx = test_idx.copy()
+            if best_gap == 0:
+                break
 
-    test_idx, val_idx = [], []
+    if best_test_idx is None or len(best_test_idx) == 0:
+        raise ValueError("Could not form a non-empty test split from non-empty scaffolds.")
 
-    # Fill test with whole scaffolds
-    for scaf in remaining_scaffolds:
-        if len(test_idx) >= n_test_target:
-            break
-        test_idx.extend(scaffold_to_idx[scaf])
+    test_set = set(best_test_idx)
 
-    # Remove test scaffolds from pool
-    test_scaffolds = set(_scaffold(smiles[i]) for i in test_idx)
-    remaining_after_test = [s for s in remaining_scaffolds if s not in test_scaffolds]
+    # train is everything else + forced scaffolds
+    train_idx = [i for i in range(len(smiles)) if i not in test_set]
 
-    # Fill val with whole scaffolds
-    for scaf in remaining_after_test:
-        if len(val_idx) >= n_val_target:
-            break
-        val_idx.extend(scaffold_to_idx[scaf])
-
-    val_scaffolds = set(_scaffold(smiles[i]) for i in val_idx)
-
-    used = set(test_idx) | set(val_idx)
-    train_idx = [i for i in range(n) if i not in used]
-    # add forced train idx (should already be in train_idx, but ensure)
-    train_idx = sorted(set(train_idx) | set(forced_train_idx))
-
-    # Final guards: ensure non-empty splits
+    # final guard
     if len(train_idx) == 0:
-        raise ValueError("Train split became empty. Too few scaffolds / too aggressive split fractions.")
-    if len(test_idx) == 0:
-        # move one scaffold from train to test
-        # pick a non-forced scaffold from train
-        train_scaffolds = [(_scaffold(smiles[i]), i) for i in train_idx]
-        movable = [i for scaf, i in train_scaffolds if scaf not in forced_train_scaffolds]
-        if len(movable) == 0:
-            raise ValueError("Cannot create non-empty test split; all data are EMPTY/INVALID scaffolds.")
-        test_idx = [movable[0]]
-        train_idx = [i for i in train_idx if i not in test_idx]
-    if len(val_idx) == 0:
-        # move one scaffold from train to val
-        train_scaffolds = [(_scaffold(smiles[i]), i) for i in train_idx]
-        movable = [i for scaf, i in train_scaffolds if scaf not in forced_train_scaffolds]
-        if len(movable) == 0:
-            # if unavoidable, allow EMPTY scaffold into val
-            val_idx = [train_idx[0]]
-            train_idx = train_idx[1:]
-        else:
-            val_idx = [movable[0]]
-            train_idx = [i for i in train_idx if i not in val_idx]
+        raise ValueError("Train split ended empty. Too few samples/scaffolds for this test_size.")
+    if len(test_set) == 0:
+        raise ValueError("Test split ended empty. Too few samples/scaffolds for this test_size.")
 
-    # sanity: no scaffold overlap (excluding forced? no, still none)
-    train_sc = set(_scaffold(smiles[i]) for i in train_idx)
-    val_sc   = set(_scaffold(smiles[i]) for i in val_idx)
-    test_sc  = set(_scaffold(smiles[i]) for i in test_idx)
-
-    if len((train_sc & val_sc)) > 0 or len((train_sc & test_sc)) > 0 or len((val_sc & test_sc)) > 0:
-        # If overlap happens due to single-index moves, fix by allowing 1-sample val/test
-        # but forcing that sample removal from train; overlap should be zero already.
-        pass
-
-    return train_idx, val_idx, test_idx
+    return X[train_idx], X[list(test_set)], y[train_idx], y[list(test_set)], train_idx, list(test_set)
 
 def main():
-    t0 = time.time()
+    t0_total = time.time()
 
     if not os.path.exists(DATA_path):
         raise FileNotFoundError(f"DATA_path not found: {DATA_path}")
@@ -162,47 +113,52 @@ def main():
     df = pd.read_excel(DATA_path)
     print("Loaded:", df.shape)
 
-    # clean
+    # numeric coercion
     df["logk"] = pd.to_numeric(df["logk"], errors="coerce")
     for c in NUM_FEATS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=["Smile","logk"] + NUM_FEATS).copy()
+    df = df.dropna(subset=["Smile","logk"] + NUM_FEATS).copy().reset_index(drop=True)
     df[NUM_FEATS] = df[NUM_FEATS].astype(np.float32)
     df["logk"] = df["logk"].astype(np.float32)
 
     # EXACT XGB target + filter
     df["logk"] = (-df["logk"]).astype(np.float32)
     df = df[(df["logk"] > 0.0) & (df["logk"] < 6.0)].copy().reset_index(drop=True)
-    print("After filter:", df.shape)
 
-    if len(df) < 10:
-        raise ValueError("Too few samples after filter (need at least ~10 for stable scaffold split).")
+    print("After filter:", df.shape)
+    if len(df) < 20:
+        raise ValueError("Too few samples after filter. Scaffold split will be unstable.")
 
     smiles = df["Smile"].values
+    Y = df["logk"].values
+    X = np.arange(len(df))  # just indices, we split indices then slice df
 
-    # robust scaffold split
-    train_idx, val_idx, test_idx = robust_scaffold_split_indices(
-        smiles, frac_train=0.70, frac_val=0.15, frac_test=0.15, random_state=SEED
+    # scaffold split train/test only
+    _, _, _, _, train_idx, test_idx = scaffold_train_test_split(
+        X, Y, smiles, test_size=0.30, random_state=SEED, n_tries=2000
     )
 
     train_df = df.iloc[train_idx].copy().reset_index(drop=True)
-    val_df   = df.iloc[val_idx].copy().reset_index(drop=True)
     test_df  = df.iloc[test_idx].copy().reset_index(drop=True)
 
-    print("Split sizes:", len(train_df), len(val_df), len(test_df))
+    print("Train/Test sizes:", len(train_df), len(test_df))
 
-    # Datasets
+    # no overlap check
+    train_scaff = set(_scaffold_or_none(s) for s in train_df["Smile"].values)
+    test_scaff  = set(_scaffold_or_none(s) for s in test_df["Smile"].values)
+    overlap = len(train_scaff & test_scaff)
+    print("Scaffold overlap (should be 0):", overlap)
+
+    # datasets
     train_dataset = Create_Dataset(train_df, NUM_FEATS)
     scaler = train_dataset.scaler
-    val_dataset   = Create_Dataset(val_df, NUM_FEATS, scaler=scaler)
-    test_dataset  = Create_Dataset(test_df, NUM_FEATS, scaler=scaler)
+    test_dataset = Create_Dataset(test_df, NUM_FEATS, scaler=scaler)
 
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn)
-    val_loader   = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
     test_loader  = DataLoader(test_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
 
-    # Model
+    # model
     experimental_input_dim = train_dataset.experimental_feats.shape[1]
     model = GNNModel(22, experimental_input_dim=experimental_input_dim)
 
@@ -211,18 +167,12 @@ def main():
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=5e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8)
 
-    # Train w/ early stop on val
-    best_path = "best_gnn_scaffold.pth"
-    best_val = float("inf")
-    patience = 25
-    bad = 0
-
+    # train
+    t_fit = time.time()
     for epoch in range(1, NUM_epochs + 1):
         model.train()
-        tr_losses = []
-
+        losses = []
         for graphs, exp_feats, targets in train_loader:
             graphs = graphs.to(device)
             exp_feats = exp_feats.to(device)
@@ -230,6 +180,7 @@ def main():
 
             optimizer.zero_grad()
             out, _, _ = model(graphs, exp_feats)
+
             out = out.view(-1)
             targets = targets.view(-1)
 
@@ -237,61 +188,46 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            tr_losses.append(loss.item())
+            losses.append(loss.item())
 
-        tr_loss = float(np.mean(tr_losses)) if tr_losses else float("nan")
+        logger.info(f"Epoch {epoch}/{NUM_epochs} train_loss={float(np.mean(losses)):.4f}")
 
-        model.eval()
-        v_losses = []
-        with torch.no_grad():
-            for graphs, exp_feats, targets in val_loader:
-                graphs = graphs.to(device)
-                exp_feats = exp_feats.to(device)
-                targets = targets.to(device)
-                out, _, _ = model(graphs, exp_feats)
-                out = out.view(-1)
-                targets = targets.view(-1)
-                v_losses.append(criterion(out, targets).item())
+    fit_seconds = time.time() - t_fit
 
-        v_loss = float(np.mean(v_losses)) if v_losses else float("nan")
-        scheduler.step(v_loss)
-
-        logger.info(f"Epoch {epoch}/{NUM_epochs} | train_loss={tr_loss:.4f} | val_loss={v_loss:.4f}")
-
-        if v_loss < best_val:
-            best_val = v_loss
-            torch.save(model.state_dict(), best_path)
-            bad = 0
-        else:
-            bad += 1
-            if bad >= patience:
-                logger.info("Early stopping.")
-                break
-
-    # Evaluate best
-    model.load_state_dict(torch.load(best_path, map_location=device))
+    # eval
     model.eval()
+    train_pred, train_tgt, *_ = collect_predictions(train_loader, model, device, criterion)
+    test_pred, test_tgt, *_   = collect_predictions(test_loader, model, device, criterion)
 
-    tr_pred, tr_tgt, *_ = collect_predictions(train_loader, model, device, criterion)
-    va_pred, va_tgt, *_ = collect_predictions(val_loader, model, device, criterion)
-    te_pred, te_tgt, *_ = collect_predictions(test_loader, model, device, criterion)
+    train_pred = np.asarray(train_pred).reshape(-1)
+    train_tgt  = np.asarray(train_tgt).reshape(-1)
+    test_pred  = np.asarray(test_pred).reshape(-1)
+    test_tgt   = np.asarray(test_tgt).reshape(-1)
 
-    tr_pred = np.asarray(tr_pred).reshape(-1); tr_tgt = np.asarray(tr_tgt).reshape(-1)
-    va_pred = np.asarray(va_pred).reshape(-1); va_tgt = np.asarray(va_tgt).reshape(-1)
-    te_pred = np.asarray(te_pred).reshape(-1); te_tgt = np.asarray(te_tgt).reshape(-1)
-
-    metrics = pd.DataFrame([
-        {"split":"Training", **_safe_metrics(tr_tgt, tr_pred)},
-        {"split":"Val",      **_safe_metrics(va_tgt, va_pred)},
-        {"split":"Test",     **_safe_metrics(te_tgt, te_pred)},
+    metrics_df = pd.DataFrame([
+        {"split":"Training", **_safe_metrics(train_tgt, train_pred)},
+        {"split":"Test",     **_safe_metrics(test_tgt,  test_pred)},
     ])
 
-    out_path = f"{OUT_PREFIX}_gnn_metrics_scaffold_train_val_test.csv"
-    metrics.to_csv(out_path, index=False)
-    print("Saved:", out_path)
-    print(metrics)
+    print(metrics_df)
 
-    print("Runtime seconds:", float(time.time() - t0))
+    # save outputs like your XGB style
+    metrics_path = f"{OUT_PREFIX}_train_test_metrics.csv"
+    metrics_df.to_csv(metrics_path, index=False)
+
+    runtime_df = pd.DataFrame([{
+        "runtime/final_fit_seconds": float(fit_seconds),
+        "runtime/total_seconds": float(time.time() - t0_total),
+        "n_train": int(len(train_df)),
+        "n_test": int(len(test_df)),
+        "n_total_filtered": int(len(df)),
+        "scaffold_overlap": int(overlap),
+    }])
+    runtime_path = f"{OUT_PREFIX}_runtime_train_test.csv"
+    runtime_df.to_csv(runtime_path, index=False)
+
+    print("Saved:", metrics_path)
+    print("Saved:", runtime_path)
 
 if __name__ == "__main__":
     main()
